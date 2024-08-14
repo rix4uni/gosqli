@@ -14,6 +14,7 @@ import (
 	"gopkg.in/yaml.v2"
 	"os/exec"
 	"github.com/fatih/color"
+	"net/url"
 )
 
 const version = "0.0.1"
@@ -191,6 +192,14 @@ func generateUniqueSessionName(baseName string) string {
     return sessionName
 }
 
+func extractDomain(u string) string {
+    parsedURL, err := url.Parse(u)
+    if err != nil {
+        return u // If parsing fails, return the original URL
+    }
+    return parsedURL.Hostname()
+}
+
 func main() {
 	url := flag.String("u", "", "URL to fetch")
 	list := flag.String("list", "", "File containing list of URLs")
@@ -361,7 +370,8 @@ func main() {
 
 								sqlFoundCount++ // Increment the counter
 						        if *stop > 0 && sqlFoundCount >= *stop {
-						            fmt.Println(Cyan("Stopping further checks for this DOMAIN due to stop flag."))
+						            // domain := extractDomain(*url)
+									fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), *url)
 
 						            if *integratecmd != "" {
 							            // Generate a unique session name
@@ -412,119 +422,131 @@ func main() {
 
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-			url := scanner.Text()
-			if strings.Contains(url, "*") {
-				statusCode, server, responseTime, err := fetchURL(url, *userAgent, *retries)
-				if err != nil {
-					fmt.Println("Error fetching the URL:", err)
-					continue
-				}
-				fmt.Printf(Yellow("ORIGINAL URL: %s\n"), url)
-				noStarURL := strings.Replace(url, "*", "", -1)
-				fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
+		    url := scanner.Text()
+		    if strings.Contains(url, "*") {
+		        originalURL := url
+		        fmt.Printf(Yellow("ORIGINAL URL: %s\n"), originalURL)
+		        noStarURL := strings.Replace(url, "*", "", -1)
+		        statusCode, server, responseTime, err := fetchURL(noStarURL, *userAgent, *retries)
+		        if err != nil {
+		            fmt.Println("Error fetching the URL:", err)
+		            continue
+		        }
+		        fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
 
-				for _, payload := range payloads {
-					modifiedURL := strings.Replace(url, "*", payload, -1)
-					statusCode, server, responseTime, err := fetchURL(modifiedURL, *userAgent, *retries)
-					if err != nil {
-						fmt.Println("Error fetching the URL:", err)
-						continue
-					}
+		        starIndexes := []int{}
+		        for i := 0; i < len(url); i++ {
+		            if url[i] == '*' {
+		                starIndexes = append(starIndexes, i)
+		            }
+		        }
 
-					// Check if status code is 403
-				    if statusCode == 403 {
-				        forbiddenCount++
-				        if forbiddenCount > *maxsca {
-				            fmt.Printf(Magenta("Skipping remaining URLs: Too many 403 responses for domain %s\n"), url)
-				            break // Skip remaining URLs for this domain
-				        }
-				    }
-			    
-					// Adding output in a empty variable
-					outputStr := ""
-					if responseTime > float64(*responseFlag) {
-						if *noColor {
-							outputStr = fmt.Sprintf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", modifiedURL, statusCode, server, responseTime)
-						} else {
-							outputStr = fmt.Sprintf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
-						}
-						fmt.Print(outputStr) // Print to the terminal
-					    if output != nil {
-					        output.WriteString(outputStr) // Save to the output file
-					    }
+		        stopProcessing := false
 
-						if *verify > 1 {
-							responseTimesSummary, isVerified, err := verifyURL(modifiedURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries)
-							if err != nil {
-								fmt.Println("Error verifying the URL:", err)
-								continue
-							}
-							if isVerified {
-								if *noColor {
-									outputStr = fmt.Sprintf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, responseTimesSummary)
-								} else {
-									outputStr = fmt.Sprintf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
-								}
+		        for _, payload := range payloads {
+		            for _, index := range starIndexes {
+		                if stopProcessing {
+		                    break
+		                }
 
-								fmt.Print(outputStr)
-								if output != nil {
-									output.WriteString(outputStr)
-								}
+		                modifiedURL := url[:index] + payload + url[index+1:]
 
-								// Call the discord function with the loaded webhookURL and messageContent
-								if *sendToDiscord && config != nil {
-									messageContent := fmt.Sprintf("```SQLI CONFIRMED: %s [%d] [%s] [%s]```\n", modifiedURL, statusCode, server, responseTimesSummary)
-									discord(config.Discord.WebhookURL, messageContent)
-								}
+		                noModifiedStarURL := strings.Replace(modifiedURL, "*", "", -1)
+		                statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries)
+		                if err != nil {
+		                    fmt.Println("Error fetching the URL:", err)
+		                    continue
+		                }
 
-								sqlFoundCount++ // Increment the counter
-					            if *stop > 0 && sqlFoundCount >= *stop {
-					                fmt.Println(Cyan("Stopping further checks for this DOMAIN due to stop flag."))
-					                
-					                if *integratecmd != "" {
-						                // Generate a unique session name
-										sessionName := generateUniqueSessionName("integratecmdSession")
+		                // Check if status code is 403
+		                if statusCode == 403 {
+		                    forbiddenCount++
+		                    if forbiddenCount > *maxsca {
+		                    	domain := extractDomain(url)
+		                        fmt.Printf(Magenta("Skipping remaining URLs: for this DOMAIN (%s) due to 403 response limit reached -maxsca.\n"), domain)
+		                        break
+		                    }
+		                }
 
-								        // Prepare the ghauri command with the URL in double quotes and run it via tmux
-										cmdStr := strings.Replace(*integratecmd, "{url}", fmt.Sprintf("\\\"%s\\\"", modifiedURL), -1)
+		                outputStr := ""
+		                if responseTime > float64(*responseFlag) {
+		                    if *noColor {
+		                        outputStr = fmt.Sprintf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", noModifiedStarURL, statusCode, server, responseTime)
+		                    } else {
+		                        outputStr = fmt.Sprintf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), noModifiedStarURL, statusCode, server, responseTime)
+		                    }
+		                    fmt.Print(outputStr)
+		                    if output != nil {
+		                        output.WriteString(outputStr)
+		                    }
 
-										// Wrap the ghauri command in a tmux command with the unique session name
-										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, cmdStr)
+		                    if *verify > 1 {
+		                        responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries)
+		                        if err != nil {
+		                            fmt.Println("Error verifying the URL:", err)
+		                            continue
+		                        }
+		                        if isVerified {
+		                            if *noColor {
+		                                outputStr = fmt.Sprintf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", noModifiedStarURL, statusCode, server, responseTimesSummary)
+		                            } else {
+		                                outputStr = fmt.Sprintf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), noModifiedStarURL, statusCode, server, responseTimesSummary)
+		                            }
 
-										fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+		                            fmt.Print(outputStr)
+		                            if output != nil {
+		                                output.WriteString(outputStr)
+		                            }
 
-										// Run the tmux command with bash
-										cmd := exec.Command("bash", "-c", tmuxCmdStr)
-										cmd.Stdout = os.Stdout
-										cmd.Stderr = os.Stderr
-										if err := cmd.Run(); err != nil {
-										    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
-										}
-									}
-					                break // Exit the payload loop for the current URL
-					            }
+		                            if *sendToDiscord && config != nil {
+		                                messageContent := fmt.Sprintf("```SQLI CONFIRMED: %s [%d] [%s] [%s]```\n", noModifiedStarURL, statusCode, server, responseTimesSummary)
+		                                discord(config.Discord.WebhookURL, messageContent)
+		                            }
 
-							} else {
-								fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
-							}
-						}
-					} else {
-						fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
-					}
-					fmt.Print(outputStr)
-					if output != nil {
-						output.WriteString(outputStr)
-					}
-				}
-			} else {
-				if *verbose {
-					fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), url)
-				}
-			}
+		                            sqlFoundCount++
+		                            if *stop > 0 && sqlFoundCount >= *stop {
+										fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), url)
+
+		                                if *integratecmd != "" {
+		                                    sessionName := generateUniqueSessionName("integratecmdSession")
+		                                    cmdStr := strings.Replace(*integratecmd, "{url}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+		                                    tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, cmdStr)
+
+		                                    fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+
+		                                    cmd := exec.Command("bash", "-c", tmuxCmdStr)
+		                                    cmd.Stdout = os.Stdout
+		                                    cmd.Stderr = os.Stderr
+		                                    if err := cmd.Run(); err != nil {
+		                                        fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+		                                    }
+		                                }
+
+		                                stopProcessing = true
+		                                break
+		                            }
+		                        } else {
+		                            fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), noModifiedStarURL, statusCode, server, responseTimesSummary)
+		                        }
+		                    }
+		                } else {
+		                    fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), noModifiedStarURL, statusCode, server, responseTime)
+		                }
+		            }
+
+		            if stopProcessing {
+		                break
+		            }
+		        }
+		    } else {
+		        if *verbose {
+		            fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), url)
+		        }
+		    }
 		}
 
 		if err := scanner.Err(); err != nil {
-			fmt.Println("Error reading the file:", err)
+		    fmt.Println("Error reading the file:", err)
 		}
 
 	} else {
@@ -541,5 +563,3 @@ func main() {
 // go run gosqli.go -u "http://testphp.vulnweb.com/artists.php?artist=1*" -payload payloads/generic.txt -o ot.txt
 
 // go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt -config ~/.config/gosqli/config.yaml -discord -integratecmd "ghauri -u {url} --level 3 --dbs --time-sec 12 --batch --flush-session"
-
-// -list flag not replacing * one by one
