@@ -44,7 +44,7 @@ var Yellow = color.New(color.FgYellow).SprintFunc()    // NORMAL REQUEST, RETRYI
 var Magenta = color.New(color.FgMagenta).SprintFunc()    // sqlFoundCount
 var Cyan = color.New(color.FgCyan).SprintFunc()
 
-func fetchURL(url string, userAgent string, retries int) (int, string, float64, error) {
+func fetchURL(urlStr string, userAgent string, retries int, proxy string) (int, string, float64, error) {
     var lastErr error
     var statusCode int
     var server string
@@ -52,19 +52,31 @@ func fetchURL(url string, userAgent string, retries int) (int, string, float64, 
 
     for attempt := 0; attempt <= retries; attempt++ {
         startTime := time.Now()
-        req, err := http.NewRequest("GET", url, nil)
+        req, err := http.NewRequest("GET", urlStr, nil)
         if err != nil {
             lastErr = err
             continue
         }
         req.Header.Set("User-Agent", userAgent)
 
+        // Create the HTTP client with optional proxy
         client := &http.Client{}
+        if proxy != "" {
+        	proxyURL, err := url.Parse(proxy)
+        	if err != nil {
+        		return 0, "", 0, fmt.Errorf("invalid proxy URL: %w", err)
+        	}
+        	transport := &http.Transport{
+        		Proxy: http.ProxyURL(proxyURL),
+        	}
+        	client = &http.Client{Transport: transport}
+        }
+
         resp, err := client.Do(req)
         if err != nil {
             lastErr = err
             if attempt < retries {
-            	fmt.Printf(Yellow("RETRYING REQUEST: %s (attempt %d/%d)\n"), url, attempt+1, retries)
+            	fmt.Printf(Yellow("RETRYING REQUEST: %s (attempt %d/%d)\n"), urlStr, attempt+1, retries)
                 // time.Sleep(2 * time.Second) // Optional: add a delay before retrying
                 continue
             }
@@ -80,10 +92,10 @@ func fetchURL(url string, userAgent string, retries int) (int, string, float64, 
     return statusCode, server, responseTime, lastErr
 }
 
-func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int) (string, bool, error) {
+func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, proxy string) (string, bool, error) {
 	var responseTimes []float64
 	for i := 0; i < verifyCount; i++ {
-		_, _, responseTime, err := fetchURL(url, userAgent, retries)
+		_, _, responseTime, err := fetchURL(url, userAgent, retries, proxy)
 		if err != nil {
 			return "", false, err
 		}
@@ -201,7 +213,7 @@ func extractDomain(u string) string {
 }
 
 func main() {
-	url := flag.String("u", "", "URL to fetch")
+	urlStr := flag.String("u", "", "URL to fetch")
 	list := flag.String("list", "", "File containing list of URLs")
 	payloadFile := flag.String("payload", "", "File containing payloads")
 	responseFlag := flag.Int("mrt", 10, "Match response with specified response time in seconds.")
@@ -220,6 +232,7 @@ func main() {
 	configPath := flag.String("config", "", "path to the config.yaml file")
 	maxsca := flag.Int("maxsca", 20, "Maximum Number of \"403\" Status Code Allowed before skipping all URLs from that domain.")
 	integratecmd := flag.String("integratecmd", "", "Send \"SQLI CONFIRMED\" to sqlmap/ghauri command via tmux")
+	proxy := flag.String("proxy", "", "HTTP proxy to use for requests (e.g., http://127.0.0.1:8080)") // Proxy flag
 	flag.Parse()
 
 	// Print version and exit if -version flag is provided
@@ -295,21 +308,21 @@ func main() {
 	// Initialize a counter for 403 status codes
 	forbiddenCount := 0
 
-	if *url != "" {
-		if strings.Contains(*url, "*") {
-			statusCode, server, responseTime, err := fetchURL(*url, *userAgent, *retries)
+	if *urlStr != "" {
+		if strings.Contains(*urlStr, "*") {
+			fmt.Printf(Yellow("ORIGINAL URL: %s\n"), *urlStr)
+			noStarURL := strings.Replace(*urlStr, "*", "", -1)
+			statusCode, server, responseTime, err := fetchURL(noStarURL, *userAgent, *retries, *proxy)
 			if err != nil {
 				fmt.Println("Error fetching the URL:", err)
 				return
 			}
-			fmt.Printf(Yellow("ORIGINAL URL: %s\n"), *url)
-			noStarURL := strings.Replace(*url, "*", "", -1)
 			fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
 			
-			nStars := strings.Count(*url, "*")
+			nStars := strings.Count(*urlStr, "*")
 			for _, payload := range payloads {
 				for i := 0; i < nStars; i++ {
-					modifiedURL := *url
+					modifiedURL := *urlStr
 					starCount := 0
 
 					// Replace the ith '*' with the payload
@@ -324,7 +337,7 @@ func main() {
 						}
 					}
 					noModifiedStarURL := strings.Replace(modifiedURL, "*", "", -1)
-					statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries)
+					statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries, *proxy)
 					if err != nil {
 						fmt.Println("Error fetching the URL:", err)
 						continue
@@ -344,7 +357,7 @@ func main() {
 						}
 
 						if *verify > 1 {
-							responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries)
+							responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy)
 							if err != nil {
 								fmt.Println("Error verifying the URL:", err)
 								continue
@@ -370,15 +383,15 @@ func main() {
 
 								sqlFoundCount++ // Increment the counter
 						        if *stop > 0 && sqlFoundCount >= *stop {
-						            // domain := extractDomain(*url)
-									fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), *url)
+						            // domain := extractDomain(*urlStr)
+									fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), *urlStr)
 
 						            if *integratecmd != "" {
 							            // Generate a unique session name
 										sessionName := generateUniqueSessionName("integratecmdSession")
 
 								        // Prepare the ghauri command with the URL in double quotes and run it via tmux
-										cmdStr := strings.Replace(*integratecmd, "{url}", fmt.Sprintf("\\\"%s\\\"", modifiedURL), -1)
+										cmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", modifiedURL), -1)
 
 										// Wrap the ghauri command in a tmux command with the unique session name
 										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, cmdStr)
@@ -422,12 +435,12 @@ func main() {
 
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
-		    url := scanner.Text()
-		    if strings.Contains(url, "*") {
-		        originalURL := url
+		    urlStr := scanner.Text()
+		    if strings.Contains(urlStr, "*") {
+		        originalURL := urlStr
 		        fmt.Printf(Yellow("ORIGINAL URL: %s\n"), originalURL)
-		        noStarURL := strings.Replace(url, "*", "", -1)
-		        statusCode, server, responseTime, err := fetchURL(noStarURL, *userAgent, *retries)
+		        noStarURL := strings.Replace(urlStr, "*", "", -1)
+		        statusCode, server, responseTime, err := fetchURL(noStarURL, *userAgent, *retries, *proxy)
 		        if err != nil {
 		            fmt.Println("Error fetching the URL:", err)
 		            continue
@@ -435,8 +448,8 @@ func main() {
 		        fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
 
 		        starIndexes := []int{}
-		        for i := 0; i < len(url); i++ {
-		            if url[i] == '*' {
+		        for i := 0; i < len(urlStr); i++ {
+		            if urlStr[i] == '*' {
 		                starIndexes = append(starIndexes, i)
 		            }
 		        }
@@ -449,10 +462,10 @@ func main() {
 		                    break
 		                }
 
-		                modifiedURL := url[:index] + payload + url[index+1:]
+		                modifiedURL := urlStr[:index] + payload + urlStr[index+1:]
 
 		                noModifiedStarURL := strings.Replace(modifiedURL, "*", "", -1)
-		                statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries)
+		                statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries, *proxy)
 		                if err != nil {
 		                    fmt.Println("Error fetching the URL:", err)
 		                    continue
@@ -462,7 +475,7 @@ func main() {
 		                if statusCode == 403 {
 		                    forbiddenCount++
 		                    if forbiddenCount > *maxsca {
-		                    	domain := extractDomain(url)
+		                    	domain := extractDomain(urlStr)
 		                        fmt.Printf(Magenta("Skipping remaining URLs: for this DOMAIN (%s) due to 403 response limit reached -maxsca.\n"), domain)
 		                        break
 		                    }
@@ -481,7 +494,7 @@ func main() {
 		                    }
 
 		                    if *verify > 1 {
-		                        responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries)
+		                        responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy)
 		                        if err != nil {
 		                            fmt.Println("Error verifying the URL:", err)
 		                            continue
@@ -505,11 +518,11 @@ func main() {
 
 		                            sqlFoundCount++
 		                            if *stop > 0 && sqlFoundCount >= *stop {
-										fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), url)
+										fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), urlStr)
 
 		                                if *integratecmd != "" {
 		                                    sessionName := generateUniqueSessionName("integratecmdSession")
-		                                    cmdStr := strings.Replace(*integratecmd, "{url}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+		                                    cmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
 		                                    tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, cmdStr)
 
 		                                    fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
@@ -540,7 +553,7 @@ func main() {
 		        }
 		    } else {
 		        if *verbose {
-		            fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), url)
+		            fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), urlStr)
 		        }
 		    }
 		}
