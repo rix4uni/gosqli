@@ -383,20 +383,26 @@ func main() {
 
 								sqlFoundCount++ // Increment the counter
 						        if *stop > 0 && sqlFoundCount >= *stop {
-						            // domain := extractDomain(*urlStr)
 									fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), *urlStr)
 
 						            if *integratecmd != "" {
 							            // Generate a unique session name
 										sessionName := generateUniqueSessionName("integratecmdSession")
 
-								        // Prepare the ghauri command with the URL in double quotes and run it via tmux
-										cmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", modifiedURL), -1)
+										// Prepare the echo command
+							    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
+							    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
+							    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+
+								        // Combine both commands
+							    		combinedCmdStr := fmt.Sprintf("%s && %s", echoCmdStr, ghauriCmdStr)
 
 										// Wrap the ghauri command in a tmux command with the unique session name
-										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, cmdStr)
+										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, combinedCmdStr)
 
 										fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+										fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
 
 										// Run the tmux command with bash
 										cmd := exec.Command("bash", "-c", tmuxCmdStr)
@@ -521,19 +527,32 @@ func main() {
 										fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), urlStr)
 
 		                                if *integratecmd != "" {
-		                                    sessionName := generateUniqueSessionName("integratecmdSession")
-		                                    cmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
-		                                    tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, cmdStr)
+								            // Generate a unique session name
+											sessionName := generateUniqueSessionName("integratecmdSession")
 
-		                                    fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+											// Prepare the echo command
+								    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
 
-		                                    cmd := exec.Command("bash", "-c", tmuxCmdStr)
-		                                    cmd.Stdout = os.Stdout
-		                                    cmd.Stderr = os.Stderr
-		                                    if err := cmd.Run(); err != nil {
-		                                        fmt.Printf("Error running ghauri command in tmux: %s\n", err)
-		                                    }
-		                                }
+								    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
+								    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+
+									        // Combine both commands
+								    		combinedCmdStr := fmt.Sprintf("%s && %s", echoCmdStr, ghauriCmdStr)
+
+											// Wrap the ghauri command in a tmux command with the unique session name
+											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, combinedCmdStr)
+
+											fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
+
+											// Run the tmux command with bash
+											cmd := exec.Command("bash", "-c", tmuxCmdStr)
+											cmd.Stdout = os.Stdout
+											cmd.Stderr = os.Stderr
+											if err := cmd.Run(); err != nil {
+											    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+											}
+										}
 
 		                                stopProcessing = true
 		                                break
@@ -575,4 +594,4 @@ func main() {
 // go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt
 // go run gosqli.go -u "http://testphp.vulnweb.com/artists.php?artist=1*" -payload payloads/generic.txt -o ot.txt
 
-// go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt -config ~/.config/gosqli/config.yaml -discord -integratecmd "ghauri -u {url} --level 3 --dbs --time-sec 12 --batch --flush-session"
+// go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt -config ~/.config/gosqli/config.yaml -discord -integratecmd "ghauri -u {urlStr} --level 3 --dbs --time-sec 12 --batch --flush-session"
