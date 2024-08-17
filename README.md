@@ -52,6 +52,10 @@ Usage of gosqli:
 go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt -icoutput -config config.yaml -discord -integratecmd "ghauri -u {urlStr} --level 3 --dbs --time-sec 12 --batch --flush-session"
 ```
 
+# flags impimantation explanation
+```
+```
+
 ## **Legal disclaimer**
 ```
 Usage of gosqli for attacking targets without prior mutual consent is illegal.
