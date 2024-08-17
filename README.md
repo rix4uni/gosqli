@@ -11,8 +11,8 @@ Usage of gosqli:
         path to the config.yaml file
   -discord
         Send "SQLI CONFIRMED" to Discord Webhook URL.
-  -ghaurioutput
-        File to save the ghaurioutput.
+  -icoutput
+        File to save the integratecmd output.
   -integratecmd string
         Send "SQLI CONFIRMED" to sqlmap/ghauri command via tmux
   -list string
