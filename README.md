@@ -1,7 +1,7 @@
 # gosqli
 
 # Usage
-```
+```console
 Usage of gosqli:
   -H string
         Custom User-Agent header for HTTP requests. (default "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
@@ -45,6 +45,11 @@ Usage of gosqli:
         Delay in seconds between verify attempts. (default 3)
   -version
         Print the version of the tool and exit.
+```
+
+# Usage Examples
+```console
+go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt -icoutput -config config.yaml -discord -integratecmd "ghauri -u {urlStr} --level 3 --dbs --time-sec 12 --batch --flush-session"
 ```
 
 ## **Legal disclaimer**
