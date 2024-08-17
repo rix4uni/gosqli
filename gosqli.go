@@ -228,6 +228,7 @@ func main() {
 	userAgent := flag.String("H", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36", "Custom User-Agent header for HTTP requests.")
 	version := flag.Bool("version", false, "Print the version of the tool and exit.")
 	verbose := flag.Bool("verbose", false, "Enable verbose output for debugging purposes.")
+	ghaurioutput := flag.Bool("ghaurioutput", false, "File to save the ghaurioutput.")
 	sendToDiscord  := flag.Bool("discord", false, "Send \"SQLI CONFIRMED\" to Discord Webhook URL.")
 	configPath := flag.String("config", "", "path to the config.yaml file")
 	maxsca := flag.Int("maxsca", 20, "Maximum Number of \"403\" Status Code Allowed before skipping all URLs from that domain.")
@@ -386,34 +387,66 @@ func main() {
 									fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), *urlStr)
 
 						            if *integratecmd != "" {
-							            // Generate a unique session name
-										sessionName := generateUniqueSessionName("integratecmdSession")
+						            	if *ghaurioutput {
+						            		// Generate a unique session name
+											sessionName := generateUniqueSessionName("integratecmdSession")
 
-										// Prepare the echo command
-							    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+											// Prepare the echo command
+									    	echoCmdStr := fmt.Sprintf("echo Running ghauri: %s | tee -a %s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
 
-							    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
-							    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+									    	// Prepare the ghauri command with the URL in double quotes and run it via tmux
+									    	ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
 
-							    		// Prepare the ghauri finished command
-								    	ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+									    	// Prepare the ghauri finished command
+									    	ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s | tee -a %s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
 
-								    	// Combine all commands
-								    	combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
+									    	// Combine the ghauri command with unbuffer and save them output via tee command, using sessionName.log
+									    	combinedCmdStr := fmt.Sprintf("%s && unbuffer %s | tee -a %s.log && %s", echoCmdStr, ghauriCmdStr, sessionName, ghauriFinished)
 
-										// Wrap the ghauri command in a tmux command with the unique session name
-										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
+											// Wrap the ghauri command in a tmux command with the unique session name
+											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
 
-										runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
-										fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
-										fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
+											runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
+											fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
+											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
 
-										// Run the tmux command with bash
-										cmd := exec.Command("bash", "-c", tmuxCmdStr)
-										cmd.Stdout = os.Stdout
-										cmd.Stderr = os.Stderr
-										if err := cmd.Run(); err != nil {
-										    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+											// Run the tmux command with bash
+											cmd := exec.Command("bash", "-c", tmuxCmdStr)
+											cmd.Stdout = os.Stdout
+											cmd.Stderr = os.Stderr
+											if err := cmd.Run(); err != nil {
+												fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+											}
+						            	} else {
+								            // Generate a unique session name
+											sessionName := generateUniqueSessionName("integratecmdSession")
+
+											// Prepare the echo command
+								    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
+								    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
+								    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+
+								    		// Prepare the ghauri finished command
+									    	ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
+									    	// Combine all commands
+									    	combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
+
+											// Wrap the ghauri command in a tmux command with the unique session name
+											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
+
+											runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
+											fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
+											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
+
+											// Run the tmux command with bash
+											cmd := exec.Command("bash", "-c", tmuxCmdStr)
+											cmd.Stdout = os.Stdout
+											cmd.Stderr = os.Stderr
+											if err := cmd.Run(); err != nil {
+											    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+											}
 										}
 									}
 							        break // Exit the payload loop for the current URL
@@ -531,34 +564,67 @@ func main() {
 										fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), urlStr)
 
 		                                if *integratecmd != "" {
-								            // Generate a unique session name
-											sessionName := generateUniqueSessionName("integratecmdSession")
 
-											// Prepare the echo command
-								    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+		                                	if *ghaurioutput {
+									            // Generate a unique session name
+												sessionName := generateUniqueSessionName("integratecmdSession")
 
-								    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
-								    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+												// Prepare the echo command
+									    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s | tee -a %s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
 
-								    		// Prepare the ghauri finished command
-								    		ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+									    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
+									    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
 
-									        // Combine both commands
-								    		combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
+									    		// Prepare the ghauri finished command
+									    		ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s | tee -a %s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
 
-											// Wrap the ghauri command in a tmux command with the unique session name
-											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
+									    		// Combine the ghauri command with unbuffer and save them output via tee command, using sessionName.log
+									    		combinedCmdStr := fmt.Sprintf("%s && unbuffer %s | tee -a %s.log && %s", echoCmdStr, ghauriCmdStr, sessionName, ghauriFinished)
 
-											runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
-											fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
-											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
+												// Wrap the ghauri command in a tmux command with the unique session name
+												tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
 
-											// Run the tmux command with bash
-											cmd := exec.Command("bash", "-c", tmuxCmdStr)
-											cmd.Stdout = os.Stdout
-											cmd.Stderr = os.Stderr
-											if err := cmd.Run(); err != nil {
-											    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+												runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
+												fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
+												fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
+
+												// Run the tmux command with bash
+												cmd := exec.Command("bash", "-c", tmuxCmdStr)
+												cmd.Stdout = os.Stdout
+												cmd.Stderr = os.Stderr
+												if err := cmd.Run(); err != nil {
+												    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+												}
+											} else {
+												// Generate a unique session name
+												sessionName := generateUniqueSessionName("integratecmdSession")
+
+												// Prepare the echo command
+									    		echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
+									    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
+									    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
+
+									    		// Prepare the ghauri finished command
+									    		ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
+										        // Combine both commands
+									    		combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
+
+												// Wrap the ghauri command in a tmux command with the unique session name
+												tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
+
+												runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
+												fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
+												fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
+
+												// Run the tmux command with bash
+												cmd := exec.Command("bash", "-c", tmuxCmdStr)
+												cmd.Stdout = os.Stdout
+												cmd.Stderr = os.Stderr
+												if err := cmd.Run(); err != nil {
+												    fmt.Printf("Error running ghauri command in tmux: %s\n", err)
+												}
 											}
 										}
 
