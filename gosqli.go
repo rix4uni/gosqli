@@ -103,7 +103,7 @@ func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay fl
 		if responseTime > responseFlag {
 			// Continue checking but mark as SQLI FOUND
 		}
-		time.Sleep(time.Duration(verifyDelay) * time.Millisecond) // Small delay between checks
+		time.Sleep(time.Duration(verifyDelay) * time.Second) // Small delay between checks
 	}
 	isVerified := len(responseTimes) > 0 && responseTimes[len(responseTimes)-1] > responseFlag
 
@@ -216,9 +216,9 @@ func main() {
 	urlStr := flag.String("u", "", "URL to fetch")
 	list := flag.String("list", "", "File containing list of URLs")
 	payloadFile := flag.String("payload", "", "File containing payloads")
-	responseFlag := flag.Int("mrt", 10, "Match response with specified response time in seconds.")
+	responseFlag := flag.Int("mrt", 10, "Match response time with specified response time in seconds.")
 	verify := flag.Int("verify", 2, "Number of times to verify \"SQLI FOUND\".")
-	verifyDelay := flag.Int("verifydelay", 500, "Delay in miliseconds between verify attempts.")
+	verifyDelay := flag.Int("verifydelay", 3, "Delay in seconds between verify attempts.")
 	retries := flag.Int("retries", 1, "Number of retry attempts for failed HTTP requests.")
 	outputFile := flag.String("o", "", "File to save the output.")
 	appendOutput := flag.String("ao", "", "File to append the output instead of overwriting.")
@@ -395,13 +395,17 @@ func main() {
 							    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
 							    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
 
-								        // Combine both commands
-							    		combinedCmdStr := fmt.Sprintf("%s && %s", echoCmdStr, ghauriCmdStr)
+							    		// Prepare the ghauri finished command
+								    	ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
+								    	// Combine all commands
+								    	combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
 
 										// Wrap the ghauri command in a tmux command with the unique session name
-										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, combinedCmdStr)
+										tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
 
-										fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+										runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
+										fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
 										fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
 
 										// Run the tmux command with bash
@@ -536,13 +540,17 @@ func main() {
 								    		// Prepare the ghauri command with the URL in double quotes and run it via tmux
 								    		ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
 
+								    		// Prepare the ghauri finished command
+								    		ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
+
 									        // Combine both commands
-								    		combinedCmdStr := fmt.Sprintf("%s && %s", echoCmdStr, ghauriCmdStr)
+								    		combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
 
 											// Wrap the ghauri command in a tmux command with the unique session name
-											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, combinedCmdStr)
+											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
 
-											fmt.Printf(Cyan("Running: %s\n"), tmuxCmdStr)
+											runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
+											fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
 											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
 
 											// Run the tmux command with bash
