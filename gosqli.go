@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+	"strconv"
 )
 
 const version = "0.0.1"
@@ -482,6 +483,9 @@ func main() {
 		}
 		defer file.Close()
 
+		NORMALREQUEST := ""
+		FalseStatusCodeCheck := ""
+		
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			urlStr := scanner.Text()
@@ -495,6 +499,9 @@ func main() {
 					continue
 				}
 				fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
+				
+				NORMALREQUEST = fmt.Sprintf(Yellow("WITHOUT SQLI PAYLOAD NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
+				FalseStatusCodeCheck = fmt.Sprintf("%d", statusCode)
 
 				starIndexes := []int{}
 				for i := 0; i < len(urlStr); i++ {
@@ -525,8 +532,22 @@ func main() {
 							forbiddenCount++
 							if forbiddenCount > *maxsca {
 								domain := extractDomain(urlStr)
-								fmt.Printf(Magenta("Skipping remaining URLs: for this DOMAIN (%s) due to 403 response limit reached -maxsca.\n"), domain)
-								break
+								
+								falseStatusCode, err := strconv.Atoi(FalseStatusCodeCheck)
+								if err != nil {
+								    fmt.Println("Error converting FalseStatusCodeCheck to int:", err)
+								    continue
+								}
+
+								// Checking falseStatusCode and statusCode is both returning 403 then Skip all remaining URLs for that DOMAIN, sometime website return 403 because of sqli payload but without sqli payload is 200, that is here we checking.
+								if falseStatusCode == statusCode {
+									fmt.Printf(Magenta("Skipping remaining URLs: for this DOMAIN (%s) due to 403 response limit reached -maxsca.\n"), domain)
+									break
+								} else {
+									if *verbose {
+										fmt.Print(NORMALREQUEST)
+									}
+								}
 							}
 						}
 
