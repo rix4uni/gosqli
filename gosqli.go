@@ -92,7 +92,7 @@ func fetchURL(urlStr string, userAgent string, retries int, proxy string) (int, 
 	return statusCode, server, responseTime, lastErr
 }
 
-func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, proxy string) (string, bool, error) {
+func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, proxy string, requiredCount int) (string, bool, error) {
 	var responseTimes []float64
 	for i := 0; i < verifyCount; i++ {
 		_, _, responseTime, err := fetchURL(url, userAgent, retries, proxy)
@@ -100,12 +100,17 @@ func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay fl
 			return "", false, err
 		}
 		responseTimes = append(responseTimes, responseTime)
-		if responseTime > responseFlag {
-			// Continue checking but mark as SQLI FOUND
-		}
 		time.Sleep(time.Duration(verifyDelay) * time.Second) // Small delay between checks
 	}
-	isVerified := len(responseTimes) > 0 && responseTimes[len(responseTimes)-1] > responseFlag
+
+	var countGreaterThanFlag int
+    for _, rt := range responseTimes {
+        if rt > responseFlag {
+            countGreaterThanFlag++
+        }
+    }
+
+	isVerified := requiredCount == 0 && len(responseTimes) > 0 && countGreaterThanFlag == len(responseTimes) || requiredCount > 0 && countGreaterThanFlag >= requiredCount
 
 	// Create the formatted response times string
 	var responseTimesStr []string
@@ -217,9 +222,10 @@ func main() {
 	list := flag.String("list", "", "File containing list of URLs")
 	payloadFile := flag.String("payload", "", "File containing payloads")
 	responseFlag := flag.Int("mrt", 10, "Match response time with specified response time in seconds.")
-	verify := flag.Int("verify", 2, "Number of times to verify \"SQLI FOUND\".")
+	verify := flag.Int("verify", 3, "Number of times to verify \"SQLI FOUND\".")
+	requiredCount := flag.Int("requiredCount", 2, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
 	verifyDelay := flag.Int("verifydelay", 3, "Delay in seconds between verify attempts.")
-	retries := flag.Int("retries", 1, "Number of retry attempts for failed HTTP requests.")
+	retries := flag.Int("retries", 0, "Number of retry attempts for failed HTTP requests.")
 	outputFile := flag.String("o", "", "File to save the output.")
 	appendOutput := flag.String("ao", "", "File to append the output instead of overwriting.")
 	silent := flag.Bool("silent", false, "silent mode.")
@@ -235,6 +241,22 @@ func main() {
 	integratecmd := flag.String("integratecmd", "", "Send \"SQLI CONFIRMED\" to sqlmap/ghauri command via tmux")
 	proxy := flag.String("proxy", "", "HTTP proxy to use for requests (e.g., http://127.0.0.1:8080)") // Proxy flag
 	flag.Parse()
+
+
+	// Display flag values at the start of the program
+    fmt.Println("-------------------------------------------")
+    fmt.Printf(" :: responseFlag    : %d\n", *responseFlag)
+    fmt.Printf(" :: verify          : %d\n", *verify)
+    fmt.Printf(" :: requiredCount   : %d\n", *requiredCount)
+    fmt.Printf(" :: verifyDelay     : %d\n", *verifyDelay)
+    fmt.Printf(" :: retries         : %d\n", *retries)
+    fmt.Printf(" :: stop            : %d\n", *stop)
+    fmt.Println("-------------------------------------------")
+
+    if *requiredCount > *verify {
+        fmt.Println(Red("Error: -requiredCount flag value cannot be greater than -verify flag value."))
+        os.Exit(1)
+    }
 
 	// Print version and exit if -version flag is provided
 	if *version {
@@ -266,6 +288,33 @@ func main() {
 			return
 		}
 	}
+
+	// Calculate total combinations
+    var totalCombinations int
+    if *urlStr != "" {
+        countStars := strings.Count(*urlStr, "*")
+        totalCombinations = countStars * len(payloads)
+        fmt.Printf(Cyan("URLs Will be Scanning with * [%d]\n\n"), totalCombinations)
+    } else if *list != "" {
+        file, err := os.Open(*list)
+        if err != nil {
+            fmt.Println("Error opening the file:", err)
+            return
+        }
+        defer file.Close()
+
+        scanner := bufio.NewScanner(file)
+        for scanner.Scan() {
+            url := scanner.Text()
+            countStars := strings.Count(url, "*")
+            totalCombinations += countStars * len(payloads)
+        }
+        if err := scanner.Err(); err != nil {
+            fmt.Println("Error reading the file:", err)
+            return
+        }
+        fmt.Printf(Cyan("URLs Will be Scanning with * [%d]\n\n"), totalCombinations)
+    }
 
 	// Create or open output file if specified
 	var output *os.File
@@ -358,7 +407,7 @@ func main() {
 						}
 
 						if *verify > 1 {
-							responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy)
+							responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy, *requiredCount)
 							if err != nil {
 								fmt.Println("Error verifying the URL:", err)
 								continue
@@ -564,7 +613,7 @@ func main() {
 							}
 
 							if *verify > 1 {
-								responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy)
+								responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy, *requiredCount)
 								if err != nil {
 									fmt.Println("Error verifying the URL:", err)
 									continue
