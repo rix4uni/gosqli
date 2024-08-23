@@ -66,5 +66,7 @@ Developer assume no liability and is not responsible for any misuse or damage ca
 ```
 
 ## **TODO**
+```
 -p flag to scan urls parallely with -list flag
 -c flag to scan payload urls parallely with -u and -list flag
+```
