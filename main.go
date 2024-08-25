@@ -11,6 +11,7 @@ import (
     "sync"
     "time"
     "github.com/fatih/color"
+    "crypto/tls"  // Import the tls package
 )
 
 // Declare package-level color functions
@@ -20,11 +21,17 @@ var Yellow = color.New(color.FgYellow).SprintFunc()
 var Magenta = color.New(color.FgMagenta).SprintFunc()
 var Cyan = color.New(color.FgCyan).SprintFunc()
 
-func fetchURL(ctx context.Context, url string, userAgent string, retries int) (int, string, float64, error) {
+func fetchURL(ctx context.Context, cancel context.CancelFunc, url string, userAgent string, retries int) (int, string, float64, error) {
     var lastErr error
     var statusCode int
     var server string
     var responseTime float64
+
+    // Custom HTTP Transport to disable HTTP/2
+    transport := &http.Transport{
+        TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+    }
+    client := &http.Client{Transport: transport}
 
     for attempt := 0; attempt <= retries; attempt++ {
         startTime := time.Now()
@@ -35,9 +42,20 @@ func fetchURL(ctx context.Context, url string, userAgent string, retries int) (i
         }
         req.Header.Set("User-Agent", userAgent)
 
-        client := &http.Client{}
         resp, err := client.Do(req)
         if err != nil {
+            if ctx.Err() == context.Canceled {
+                // If context is canceled, exit early
+                return 0, "", 0, ctx.Err()
+            }
+
+            // Check if the error is a protocol error and cancel the context
+            if strings.Contains(err.Error(), "PROTOCOL_ERROR") {
+                fmt.Println("Protocol error detected, cancelling the request.")
+                cancel() // Cancels the context
+                return 0, "", 0, err
+            }
+
             lastErr = err
             if attempt < retries {
                 fmt.Printf(Yellow("RETRYING REQUEST: %s (attempt %d/%d)\n"), url, attempt+1, retries)
@@ -55,10 +73,10 @@ func fetchURL(ctx context.Context, url string, userAgent string, retries int) (i
     return statusCode, server, responseTime, lastErr
 }
 
-func verifyURL(ctx context.Context, url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, requiredCount int) (string, bool, error) {
+func verifyURL(ctx context.Context, cancel context.CancelFunc, url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, requiredCount int) (string, bool, error) {
     var responseTimes []float64
     for i := 0; i < verifyCount; i++ {
-        _, _, responseTime, err := fetchURL(ctx, url, userAgent, retries)
+        _, _, responseTime, err := fetchURL(ctx, cancel, url, userAgent, retries)
         if err != nil {
             return "", false, err
         }
@@ -89,7 +107,7 @@ func processURL(ctx context.Context, cancel context.CancelFunc, url string, payl
 
     sqlFoundCount := 0 // Reset for each URL
 
-    statusCode, server, responseTime, err := fetchURL(ctx, url, userAgent, retries)
+    statusCode, server, responseTime, err := fetchURL(ctx, cancel, url, userAgent, retries)
     if err != nil {
         fmt.Println("Error fetching the URL:", err)
         return
@@ -113,7 +131,7 @@ func processURL(ctx context.Context, cancel context.CancelFunc, url string, payl
                 defer payloadWg.Done()
 
                 modifiedURL := strings.Replace(url, "*", payload, -1)
-                statusCode, server, responseTime, err := fetchURL(ctx, modifiedURL, userAgent, retries)
+                statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, userAgent, retries)
                 if err != nil {
                     if ctx.Err() == context.Canceled {
                         // Skip further processing if context is canceled
@@ -131,7 +149,7 @@ func processURL(ctx context.Context, cancel context.CancelFunc, url string, payl
                     }
 
                     if verify > 1 {
-                        responseTimesSummary, isVerified, err := verifyURL(ctx, modifiedURL, verify, float64(responseFlag), float64(verifyDelay), userAgent, retries, requiredCount)
+                        responseTimesSummary, isVerified, err := verifyURL(ctx, cancel, modifiedURL, verify, float64(responseFlag), float64(verifyDelay), userAgent, retries, requiredCount)
                         if err != nil {
                             if ctx.Err() == context.Canceled {
                                 // Skip further processing if context is canceled
@@ -182,12 +200,12 @@ func main() {
     verify := flag.Int("verify", 3, "Number of times to verify \"SQLI FOUND\".")
     requiredCount := flag.Int("requiredCount", 2, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
     verifyDelay := flag.Int("verifydelay", 3000, "Delay in milliseconds between verify attempts.")
-    retries := flag.Int("retries", 1, "Number of retry attempts for failed HTTP requests.")
+    retries := flag.Int("retries", 0, "Number of retry attempts for failed HTTP requests.")
     noColor := flag.Bool("nc", false, "Do not save colored output.")
     stop := flag.Int("stop", 1, "Stop checking pending HTTP requests after [stop] (0: means check all).")
     userAgent := flag.String("H", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36", "Custom User-Agent header for HTTP requests.")
-    maxParallel := flag.Int("parallel", 50, "Maximum number of URLs Scan Parallely.")
-    maxConcurrency := flag.Int("concurrency", 50, "Maximum number of Payloads Scan concurrent.")
+    maxParallel := flag.Int("parallel", 100, "Maximum number of URLs Scan Parallely.")
+    maxConcurrency := flag.Int("concurrency", 100, "Maximum number of Payloads Scan concurrent.")
     flag.Parse()
 
     // Display flag values at the start of the program
@@ -263,7 +281,7 @@ func main() {
 
     if *url != "" {
         if strings.Contains(*url, "*") {
-            statusCode, server, responseTime, err := fetchURL(ctx, *url, *userAgent, *retries)
+            statusCode, server, responseTime, err := fetchURL(ctx, cancel, *url, *userAgent, *retries)
             if err != nil {
                 fmt.Println("Error fetching the URL:", err)
                 return
@@ -287,7 +305,7 @@ func main() {
                         defer payloadWg.Done()
 
                         modifiedURL := strings.Replace(*url, "*", payload, -1)
-                        statusCode, server, responseTime, err := fetchURL(ctx, modifiedURL, *userAgent, *retries)
+                        statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, *userAgent, *retries)
                         if err != nil {
                             fmt.Println("Error fetching the URL:", err)
                             return
@@ -301,7 +319,7 @@ func main() {
                             }
 
                             if *verify > 1 {
-                                responseTimesSummary, isVerified, err := verifyURL(ctx, modifiedURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *requiredCount)
+                                responseTimesSummary, isVerified, err := verifyURL(ctx, cancel, modifiedURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *requiredCount)
                                 if err != nil {
                                     fmt.Println("Error verifying the URL:", err)
                                     return
