@@ -130,6 +130,11 @@ func processURL(ctx context.Context, cancel context.CancelFunc, url string, payl
                 defer func() { <-payloadSem }()
                 defer payloadWg.Done()
 
+                // Check if ADDTIME exists in the payload and replace it with 10
+                if strings.Contains(payload, "ADDTIME") {
+                    payload = strings.Replace(payload, "ADDTIME", "10", -1)
+                }
+
                 modifiedURL := strings.Replace(url, "*", payload, -1)
                 statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, userAgent, retries)
                 if err != nil {
@@ -197,10 +202,10 @@ func main() {
     list := flag.String("list", "", "File containing list of URLs")
     payloadFile := flag.String("payload", "", "File containing payloads")
     responseFlag := flag.Int("mrt", 10, "Match response with specified response time in seconds.")
-    verify := flag.Int("verify", 3, "Number of times to verify \"SQLI FOUND\".")
-    requiredCount := flag.Int("requiredCount", 2, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
-    verifyDelay := flag.Int("verifydelay", 3000, "Delay in milliseconds between verify attempts.")
-    retries := flag.Int("retries", 0, "Number of retry attempts for failed HTTP requests.")
+    verify := flag.Int("verify", 5, "Number of times to verify \"SQLI FOUND\".")
+    requiredCount := flag.Int("requiredCount", 0, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
+    verifyDelay := flag.Int("verifydelay", 12000, "Delay in milliseconds between verify attempts.")
+    retries := flag.Int("retries", 10, "Number of retry attempts for failed HTTP requests.")
     noColor := flag.Bool("nc", false, "Do not save colored output.")
     stop := flag.Int("stop", 1, "Stop checking pending HTTP requests after [stop] (0: means check all).")
     userAgent := flag.String("H", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36", "Custom User-Agent header for HTTP requests.")
@@ -303,6 +308,11 @@ func main() {
                     go func(payload string) {
                         defer func() { <-payloadSem }()
                         defer payloadWg.Done()
+
+                        // Check if ADDTIME exists in the payload and replace it with 10
+                        if strings.Contains(payload, "ADDTIME") {
+                            payload = strings.Replace(payload, "ADDTIME", "10", -1)
+                        }
 
                         modifiedURL := strings.Replace(*url, "*", payload, -1)
                         statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, *userAgent, *retries)
