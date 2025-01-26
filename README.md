@@ -1,72 +1,79 @@
-# gosqli
+## gosqli
 
-# Usage
-```console
+gosqli is a fast and simple tool for detecting blind SQL injection vulnerabilities. It supports scanning URLs with custom payloads, parallel requests, and response time-based verification.
+
+## Installation
+```
+go install github.com/rix4uni/gosqli@latest
+```
+
+## Download prebuilt binaries
+```
+wget https://github.com/rix4uni/gosqli/releases/download/v0.0.1/gosqli-linux-amd64-0.0.1.tgz
+tar -xvzf gosqli-linux-amd64-0.0.1.tgz
+rm -rf gosqli-linux-amd64-0.0.1.tgz
+mv gosqli ~/go/bin/gosqli
+```
+Or download [binary release](https://github.com/rix4uni/gosqli/releases) for your platform.
+
+## Compile from source
+```
+git clone --depth 1 github.com/rix4uni/gosqli.git
+cd gosqli; go install
+```
+
+## Usage
+```
 Usage of gosqli:
   -H string
-    	Custom User-Agent header for HTTP requests. (default "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
-  -ao string
-    	File to append the output instead of overwriting.
-  -config string
-    	path to the config.yaml file
-  -discord
-    	Send "SQLI CONFIRMED" to Discord Webhook URL.
-  -icoutput
-    	File to save the integratecmd output.
-  -integratecmd string
-    	Send "SQLI CONFIRMED" to sqlmap/ghauri command via tmux
+        Custom User-Agent header for HTTP requests. (default "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36")
+  -concurrency int
+        Maximum number of Payloads Scan concurrent. (default 20)
   -list string
-    	File containing list of URLs
-  -maxsca int
-    	Maximum Number of "403" Status Code Allowed before skipping all URLs from that domain. (default 20)
+        File containing list of URLs
   -mrt int
-    	Match response time with specified response time in seconds. (default 10)
+        Match response time with specified response time in seconds. (default 10)
   -nc
-    	Do not Save colored output.
-  -o string
-    	File to save the output.
+        Do not save colored output.
+  -parallel int
+        Maximum number of URLs Scan Parallely. (default 1)
   -payload string
-    	File containing payloads
-  -proxy string
-    	HTTP proxy to use for requests (e.g., http://127.0.0.1:8080)
+        File containing payloads
   -requiredCount int
-    	Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all). (default 2)
+        Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).
   -retries int
-    	Number of retry attempts for failed HTTP requests.
+        Number of retry attempts for failed HTTP requests.
   -silent
-    	silent mode.
+        silent mode.
   -stop int
-    	Stop checking pending HTTP requests after [stop] (0: means check all). (default 1)
+        Stop checking pending HTTP requests after [stop] (0: means check all). (default 1)
   -u string
-    	URL to fetch
-  -verbose
-    	Enable verbose output for debugging purposes.
+        URL to fetch
   -verify int
-    	Number of times to verify "SQLI FOUND". (default 3)
+        Number of times to verify "SQLI FOUND". (default 3)
   -verifydelay int
-    	Delay in seconds between verify attempts. (default 3)
+        Delay in milliseconds between verify attempts. (default 12000)
   -version
-    	Print the version of the tool and exit.
+        Print the version of the tool and exit.
 ```
 
-# Usage Examples
-```console
-go run gosqli.go -list urls.txt -payload payloads/generic.txt -o ot.txt -icoutput -config config.yaml -discord -integratecmd "ghauri -u {urlStr} --level 3 --dbs --time-sec 12 --batch --flush-session"
+## Usage Examples
+Single URLs:
+```
+▶ gosqli -u "http://testphp.vulnweb.com/AJAX/infocateg.php?id=1*" -payload payloads/generic.txt
 ```
 
-# flags impimantation explanation
+Multiple URLs:
 ```
+▶ cat urls.txt
+http://testphp.vulnweb.com/AJAX/infocateg.php?id=1*
+http://testphp.vulnweb.com/artists.php?artist=1*
+
+▶ gosqli -list urls.txt -payload payloads/generic.txt
 ```
 
-## **Legal disclaimer**
+Oneliner:
 ```
-Usage of gosqli for attacking targets without prior mutual consent is illegal.
-It is the end user's responsibility to obey all applicable local,state and federal laws. 
-Developer assume no liability and is not responsible for any misuse or damage caused by this program.
-```
-
-## **TODO**
-```
--p flag to scan urls parallely with -list flag
--c flag to scan payload urls parallely with -u and -list flag
+▶ echo "testphp.vulnweb.com" | waybackurls | urldedupe -s | pvreplace -silent -payload "*" -fuzzing-part param-value -fuzzing-type replace -fuzzing-mode single | unew -ef -el -t -i -q urls.txt
+▶ gosqli -list urls.txt -payload payloads/generic.txt | tee -a gosqli.txt
 ```

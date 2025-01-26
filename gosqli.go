@@ -1,298 +1,276 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"github.com/fatih/color"
-	"gopkg.in/yaml.v2"
-	"io/ioutil"
-	"net/http"
-	"net/url"
-	"os"
-	"os/exec"
-	"strings"
-	"time"
-	"strconv"
+    "bufio"
+    "context"
+    "flag"
+    "fmt"
+    "net/http"
+    "os"
+    "strings"
+    "sync"
+    "time"
+    "github.com/fatih/color"
+    "crypto/tls"
+
+    "github.com/rix4uni/gosqli/banner"
 )
 
-const version = "0.0.1"
-
-func printVersion() {
-	fmt.Printf("gosqli version %s\n", version)
-}
-
-func printBanner() {
-	banner := `  ▄████  ▒█████    ██████   █████   ██▓     ██▓
- ██▒ ▀█▒▒██▒  ██▒▒██    ▒ ▒██▓  ██▒▓██▒    ▓██▒
-▒██░▄▄▄░▒██░  ██▒░ ▓██▄   ▒██▒  ██░▒██░    ▒██▒
-░▓█  ██▓▒██   ██░  ▒   ██▒░██  █▀ ░▒██░    ░██░
-░▒▓███▀▒░ ████▓▒░▒██████▒▒░▒███▒█▄ ░██████▒░██░
- ░▒   ▒ ░ ▒░▒░▒░ ▒ ▒▓▒ ▒ ░░░ ▒▒░ ▒ ░ ▒░▓  ░░▓
-  ░   ░   ░ ▒ ▒░ ░ ░▒  ░ ░ ░ ▒░  ░ ░ ░ ▒  ░ ▒ ░
-░ ░   ░ ░ ░ ░ ▒  ░  ░  ░     ░   ░   ░ ░    ▒ ░
-      ░     ░ ░        ░      ░        ░  ░ ░`
-	fmt.Printf(Cyan("%s\n%55s\n"), banner, "gosqli version "+version)
-}
-
 // Declare package-level color functions
-var Red = color.New(color.FgRed).SprintFunc()         // SQLI FOUND, SQLI CONFIRMED
-var Green = color.New(color.FgGreen).SprintFunc()     // NOT FOUND, SQLI NOT CONFIRMED
-var Yellow = color.New(color.FgYellow).SprintFunc()   // NORMAL REQUEST, RETRYING REQUEST
-var Magenta = color.New(color.FgMagenta).SprintFunc() // sqlFoundCount
+var Red = color.New(color.FgRed).SprintFunc()
+var Green = color.New(color.FgGreen).SprintFunc()
+var Yellow = color.New(color.FgYellow).SprintFunc()
+var Magenta = color.New(color.FgMagenta).SprintFunc()
 var Cyan = color.New(color.FgCyan).SprintFunc()
 
-func fetchURL(urlStr string, userAgent string, retries int, proxy string) (int, string, float64, error) {
-	var lastErr error
-	var statusCode int
-	var server string
-	var responseTime float64
+func fetchURL(ctx context.Context, cancel context.CancelFunc, url string, userAgent string, retries int) (int, string, float64, error) {
+    var lastErr error
+    var statusCode int
+    var server string
+    var responseTime float64
 
-	for attempt := 0; attempt <= retries; attempt++ {
-		startTime := time.Now()
-		req, err := http.NewRequest("GET", urlStr, nil)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", userAgent)
+    // Custom HTTP Transport to disable HTTP/2
+    transport := &http.Transport{
+        TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+    }
+    client := &http.Client{Transport: transport}
 
-		// Create the HTTP client with optional proxy
-		client := &http.Client{}
-		if proxy != "" {
-			proxyURL, err := url.Parse(proxy)
-			if err != nil {
-				return 0, "", 0, fmt.Errorf("invalid proxy URL: %w", err)
-			}
-			transport := &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-			}
-			client = &http.Client{Transport: transport}
-		}
+    for attempt := 0; attempt <= retries; attempt++ {
+        startTime := time.Now()
+        req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+        if err != nil {
+            lastErr = err
+            continue
+        }
+        req.Header.Set("User-Agent", userAgent)
 
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = err
-			if attempt < retries {
-				fmt.Printf(Yellow("RETRYING REQUEST: %s (attempt %d/%d)\n"), urlStr, attempt+1, retries)
-				// time.Sleep(2 * time.Second) // Optional: add a delay before retrying
-				continue
-			}
-			return 0, "", 0, lastErr
-		}
-		defer resp.Body.Close()
+        resp, err := client.Do(req)
+        if err != nil {
+            if ctx.Err() == context.Canceled {
+                // If context is canceled, exit early
+                return 0, "", 0, ctx.Err()
+            }
 
-		responseTime = time.Since(startTime).Seconds()
-		server = resp.Header.Get("Server")
-		statusCode = resp.StatusCode
-		return statusCode, server, responseTime, nil
-	}
-	return statusCode, server, responseTime, lastErr
+            // Check if the error is a protocol error and cancel the context
+            if strings.Contains(err.Error(), "PROTOCOL_ERROR") {
+                fmt.Println("Protocol error detected, cancelling the request.")
+                cancel() // Cancels the context
+                return 0, "", 0, err
+            }
+
+            lastErr = err
+            if attempt < retries {
+                fmt.Printf(Yellow("RETRYING REQUEST: %s (attempt %d/%d)\n"), url, attempt+1, retries)
+                continue
+            }
+            return 0, "", 0, lastErr
+        }
+        defer resp.Body.Close()
+
+        responseTime = time.Since(startTime).Seconds()
+        server = resp.Header.Get("Server")
+        statusCode = resp.StatusCode
+        return statusCode, server, responseTime, nil
+    }
+    return statusCode, server, responseTime, lastErr
 }
 
-func verifyURL(url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, proxy string, requiredCount int) (string, bool, error) {
-	var responseTimes []float64
-	for i := 0; i < verifyCount; i++ {
-		_, _, responseTime, err := fetchURL(url, userAgent, retries, proxy)
-		if err != nil {
-			return "", false, err
-		}
-		responseTimes = append(responseTimes, responseTime)
-		time.Sleep(time.Duration(verifyDelay) * time.Second) // Small delay between checks
-	}
+func verifyURL(ctx context.Context, cancel context.CancelFunc, url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, requiredCount int) (string, bool, error) {
+    var responseTimes []float64
+    for i := 0; i < verifyCount; i++ {
+        _, _, responseTime, err := fetchURL(ctx, cancel, url, userAgent, retries)
+        if err != nil {
+            return "", false, err
+        }
+        responseTimes = append(responseTimes, responseTime)
+        time.Sleep(time.Duration(verifyDelay) * time.Millisecond)
+    }
 
-	var countGreaterThanFlag int
+    var countGreaterThanFlag int
     for _, rt := range responseTimes {
         if rt > responseFlag {
             countGreaterThanFlag++
         }
     }
 
-	isVerified := requiredCount == 0 && len(responseTimes) > 0 && countGreaterThanFlag == len(responseTimes) || requiredCount > 0 && countGreaterThanFlag >= requiredCount
+    isVerified := requiredCount == 0 && len(responseTimes) > 0 && countGreaterThanFlag == len(responseTimes) || requiredCount > 0 && countGreaterThanFlag >= requiredCount
 
-	// Create the formatted response times string
-	var responseTimesStr []string
-	for _, rt := range responseTimes {
-		responseTimesStr = append(responseTimesStr, fmt.Sprintf("%.2f s", rt))
-	}
-	responseTimesSummary := strings.Join(responseTimesStr, ", ")
+    var responseTimesStr []string
+    for _, rt := range responseTimes {
+        responseTimesStr = append(responseTimesStr, fmt.Sprintf("%.2f s", rt))
+    }
+    responseTimesSummary := strings.Join(responseTimesStr, ", ")
 
-	return responseTimesSummary, isVerified, nil
+    return responseTimesSummary, isVerified, nil
 }
 
-// Config structure to hold the YAML data
-type Config struct {
-	Discord struct {
-		WebhookURL string `yaml:"webhook_url"`
-	} `yaml:"discord"`
+func processURL(ctx context.Context, cancel context.CancelFunc, url string, payloads []string, responseFlag, verify, verifyDelay, retries int, noColor bool, userAgent string, stop int, wg *sync.WaitGroup, mu *sync.Mutex, stopOnce *sync.Once, maxConcurrency int, requiredCount int) {
+    defer wg.Done()
+
+    sqlFoundCount := 0 // Reset for each URL
+
+    statusCode, server, responseTime, err := fetchURL(ctx, cancel, url, userAgent, retries)
+    if err != nil {
+        fmt.Println("Error fetching the URL:", err)
+        return
+    }
+    nStarURL := strings.Replace(url, "*", "", -1)
+    fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), nStarURL, statusCode, server, responseTime)
+
+    var payloadWg sync.WaitGroup
+    payloadSem := make(chan struct{}, maxConcurrency)
+
+    for _, payload := range payloads {
+        select {
+        case <-ctx.Done():
+            fmt.Println(Cyan("Stopping further payloads due to context cancellation."))
+            return
+        default:
+            payloadSem <- struct{}{}
+            payloadWg.Add(1)
+            go func(payload string) {
+                defer func() { <-payloadSem }()
+                defer payloadWg.Done()
+
+                // Check if ADDTIME exists in the payload and replace it with 10
+                if strings.Contains(payload, "ADDTIME") {
+                    payload = strings.Replace(payload, "ADDTIME", "10", -1)
+                }
+
+                modifiedURL := strings.Replace(url, "*", payload, -1)
+                statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, userAgent, retries)
+                if err != nil {
+                    if ctx.Err() == context.Canceled {
+                        // Skip further processing if context is canceled
+                        return
+                    }
+                    fmt.Println("Error fetching the URL:", err)
+                    return
+                }
+
+                if responseTime > float64(responseFlag) {
+                    if noColor {
+                        fmt.Printf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", modifiedURL, statusCode, server, responseTime)
+                    } else {
+                        fmt.Printf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+                    }
+
+                    if verify > 1 {
+                        responseTimesSummary, isVerified, err := verifyURL(ctx, cancel, modifiedURL, verify, float64(responseFlag), float64(verifyDelay), userAgent, retries, requiredCount)
+                        if err != nil {
+                            if ctx.Err() == context.Canceled {
+                                // Skip further processing if context is canceled
+                                return
+                            }
+                            fmt.Println("Error verifying the URL:", err)
+                            return
+                        }
+                        if isVerified {
+                            mu.Lock()
+                            defer mu.Unlock()
+
+                            select {
+                            case <-ctx.Done():
+                                return
+                            default:
+                                if noColor {
+                                    fmt.Printf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, responseTimesSummary)
+                                } else {
+                                    fmt.Printf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
+                                }
+
+                                sqlFoundCount++ // No need to dereference
+                                if stop > 0 && sqlFoundCount >= stop {
+                                    fmt.Println(Cyan("Stopping further checks for this URL due to stop flag."))
+                                    stopOnce.Do(cancel)
+                                    return
+                                }
+                            }
+                        } else {
+                            fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
+                        }
+                    }
+                } else {
+                    fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+                }
+            }(payload)
+        }
+    }
+    payloadWg.Wait()
 }
 
-// Function to load the configuration from a YAML file
-func loadConfig(configFile string) (*Config, error) {
-	config := &Config{}
-
-	// Read the YAML file
-	file, err := ioutil.ReadFile(configFile)
-	if err != nil {
-		return nil, err
-	}
-
-	// Unmarshal the YAML data into the Config struct
-	err = yaml.Unmarshal(file, config)
-	if err != nil {
-		return nil, err
-	}
-
-	return config, nil
-}
-
-// Function to send a message to Discord
-func discord(webhookURL, messageContent string) {
-	// Create a map to hold the JSON payload
-	payload := map[string]string{
-		"content": messageContent,
-	}
-
-	// Marshal the payload to JSON
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		fmt.Println("Error marshaling payload:", err)
-		return
-	}
-
-	// Create a new POST request with the payload
-	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
-	}
-
-	// Set the Content-Type header to application/json
-	req.Header.Set("Content-Type", "application/json")
-
-	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error sending request:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Check if the request was successful
-	if resp.StatusCode == http.StatusNoContent {
-		fmt.Println(Cyan("\"SQLI CONFIRMED\" Message sent to Discord successfully!"))
-	} else {
-		fmt.Printf("Failed to send message. Status code: %d\n", resp.StatusCode)
-	}
-}
-
-// Function to generate a unique tmux session name
-func generateUniqueSessionName(baseName string) string {
-	sessionName := baseName
-	sessionNumber := 0
-
-	for {
-		// Check if the session already exists
-		cmd := exec.Command("tmux", "has-session", "-t", sessionName)
-		if err := cmd.Run(); err != nil {
-			// If the session doesn't exist, break the loop
-			break
-		}
-		// If it exists, increment the session number and try again
-		sessionNumber++
-		sessionName = fmt.Sprintf("%s%d", baseName, sessionNumber)
-	}
-
-	return sessionName
-}
-
-func extractDomain(u string) string {
-	parsedURL, err := url.Parse(u)
-	if err != nil {
-		return u // If parsing fails, return the original URL
-	}
-	return parsedURL.Hostname()
+// Display flag values at the start of the program
+func PrintInfo(responseFlag, verify, requiredCount, verifyDelay, retries, stop, maxParallel, maxConcurrency int) {
+	fmt.Println("-------------------------------------------")
+	fmt.Printf(" :: responseFlag    : %d\n", responseFlag)
+	fmt.Printf(" :: verify          : %d\n", verify)
+	fmt.Printf(" :: requiredCount   : %d\n", requiredCount)
+	fmt.Printf(" :: verifyDelay     : %d\n", verifyDelay)
+	fmt.Printf(" :: retries         : %d\n", retries)
+	fmt.Printf(" :: stop            : %d\n", stop)
+	fmt.Printf(" :: maxParallel     : %d\n", maxParallel)
+	fmt.Printf(" :: maxConcurrency  : %d\n", maxConcurrency)
+	fmt.Println("-------------------------------------------")
 }
 
 func main() {
-	urlStr := flag.String("u", "", "URL to fetch")
-	list := flag.String("list", "", "File containing list of URLs")
-	payloadFile := flag.String("payload", "", "File containing payloads")
-	responseFlag := flag.Int("mrt", 10, "Match response time with specified response time in seconds.")
-	verify := flag.Int("verify", 3, "Number of times to verify \"SQLI FOUND\".")
-	requiredCount := flag.Int("requiredCount", 2, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
-	verifyDelay := flag.Int("verifydelay", 3, "Delay in seconds between verify attempts.")
-	retries := flag.Int("retries", 0, "Number of retry attempts for failed HTTP requests.")
-	outputFile := flag.String("o", "", "File to save the output.")
-	appendOutput := flag.String("ao", "", "File to append the output instead of overwriting.")
-	silent := flag.Bool("silent", false, "silent mode.")
-	noColor := flag.Bool("nc", false, "Do not Save colored output.")
-	stop := flag.Int("stop", 1, "Stop checking pending HTTP requests after [stop] (0: means check all).")
-	userAgent := flag.String("H", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36", "Custom User-Agent header for HTTP requests.")
-	version := flag.Bool("version", false, "Print the version of the tool and exit.")
-	verbose := flag.Bool("verbose", false, "Enable verbose output for debugging purposes.")
-	icoutput := flag.Bool("icoutput", false, "File to save the integratecmd output.")
-	sendToDiscord := flag.Bool("discord", false, "Send \"SQLI CONFIRMED\" to Discord Webhook URL.")
-	configPath := flag.String("config", "", "path to the config.yaml file")
-	maxsca := flag.Int("maxsca", 20, "Maximum Number of \"403\" Status Code Allowed before skipping all URLs from that domain.")
-	integratecmd := flag.String("integratecmd", "", "Send \"SQLI CONFIRMED\" to sqlmap/ghauri command via tmux")
-	proxy := flag.String("proxy", "", "HTTP proxy to use for requests (e.g., http://127.0.0.1:8080)") // Proxy flag
-	flag.Parse()
+    url := flag.String("u", "", "URL to fetch")
+    list := flag.String("list", "", "File containing list of URLs")
+    payloadFile := flag.String("payload", "", "File containing payloads")
+    responseFlag := flag.Int("mrt", 10, "Match response time with specified response time in seconds.")
+    verify := flag.Int("verify", 3, "Number of times to verify \"SQLI FOUND\".")
+    requiredCount := flag.Int("requiredCount", 0, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
+    verifyDelay := flag.Int("verifydelay", 12000, "Delay in milliseconds between verify attempts.")
+    retries := flag.Int("retries", 0, "Number of retry attempts for failed HTTP requests.")
+    noColor := flag.Bool("nc", false, "Do not save colored output.")
+    stop := flag.Int("stop", 1, "Stop checking pending HTTP requests after [stop] (0: means check all).")
+    userAgent := flag.String("H", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36", "Custom User-Agent header for HTTP requests.")
+    maxParallel := flag.Int("parallel", 1, "Maximum number of URLs Scan Parallely.")
+    maxConcurrency := flag.Int("concurrency", 20, "Maximum number of Payloads Scan concurrent.")
+    silent := flag.Bool("silent", false, "silent mode.")
+    versionFlag := flag.Bool("version", false, "Print the version of the tool and exit.")
+    flag.Parse()
 
+    if *versionFlag {
+        banner.PrintBanner()
+        banner.PrintVersion()
+        return
+    }
 
-	// Display flag values at the start of the program
-    fmt.Println("-------------------------------------------")
-    fmt.Printf(" :: responseFlag    : %d\n", *responseFlag)
-    fmt.Printf(" :: verify          : %d\n", *verify)
-    fmt.Printf(" :: requiredCount   : %d\n", *requiredCount)
-    fmt.Printf(" :: verifyDelay     : %d\n", *verifyDelay)
-    fmt.Printf(" :: retries         : %d\n", *retries)
-    fmt.Printf(" :: stop            : %d\n", *stop)
-    fmt.Println("-------------------------------------------")
+    if !*silent {
+        banner.PrintBanner()
+        PrintInfo(*responseFlag, *verify, *requiredCount, *verifyDelay, *retries, *stop, *maxParallel, *maxConcurrency)
+    }
 
     if *requiredCount > *verify {
         fmt.Println(Red("Error: -requiredCount flag value cannot be greater than -verify flag value."))
         os.Exit(1)
     }
 
-	// Print version and exit if -version flag is provided
-	if *version {
-		printVersion()
-		return
-	}
+    var payloads []string
+    if *payloadFile != "" {
+        file, err := os.Open(*payloadFile)
+        if err != nil {
+            fmt.Println("Error opening the payload file:", err)
+            return
+        }
+        defer file.Close()
 
-	// Don't Print banner if -silnet flag is provided
-	if !*silent {
-		printBanner()
-	}
+        scanner := bufio.NewScanner(file)
+        for scanner.Scan() {
+            payloads = append(payloads, scanner.Text())
+        }
 
-	var payloads []string
-	if *payloadFile != "" {
-		file, err := os.Open(*payloadFile)
-		if err != nil {
-			fmt.Println("Error opening the payload file:", err)
-			return
-		}
-		defer file.Close()
+        if err := scanner.Err(); err != nil {
+            fmt.Println("Error reading the payload file:", err)
+            return
+        }
+    }
 
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			payloads = append(payloads, scanner.Text())
-		}
-
-		if err := scanner.Err(); err != nil {
-			fmt.Println("Error reading the payload file:", err)
-			return
-		}
-	}
-
-	// Calculate total combinations
+    // Calculate total combinations
     var totalCombinations int
-    if *urlStr != "" {
-        countStars := strings.Count(*urlStr, "*")
+    if *url != "" {
+        countStars := strings.Count(*url, "*")
         totalCombinations = countStars * len(payloads)
         fmt.Printf(Cyan("URLs Will be Scanning with * [%d]\n\n"), totalCombinations)
     } else if *list != "" {
@@ -316,429 +294,131 @@ func main() {
         fmt.Printf(Cyan("URLs Will be Scanning with * [%d]\n\n"), totalCombinations)
     }
 
-	// Create or open output file if specified
-	var output *os.File
-	var err error // Declare err here
-	if *outputFile != "" {
-		output, err = os.Create(*outputFile)
-		if err != nil {
-			fmt.Println("Error creating output file:", err)
-			return
-		}
-		defer output.Close()
-	} else if *appendOutput != "" {
-		output, err = os.OpenFile(*appendOutput, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-		if err != nil {
-			fmt.Println("Error opening output file for appending:", err)
-			return
-		}
-		defer output.Close()
-	}
-
-	// Initialize a counter for SQLI FOUND results
-	sqlFoundCount := 0
-
-	// Check if both -config and -discord flags are used together
-	if (*sendToDiscord && *configPath == "") || (!*sendToDiscord && *configPath != "") {
-		fmt.Println("Error: Both -config and -discord must be provided together.")
-		os.Exit(1)
-	}
-
-	var config *Config
-
-	// Only load the configuration if -config is provided
-	if *sendToDiscord && *configPath != "" {
-		config, err = loadConfig(*configPath)
-		if err != nil {
-			fmt.Println("Error loading config:", err)
-			os.Exit(1)
-		}
-	}
-
-	// Initialize a counter for 403 status codes
-	forbiddenCount := 0
-
-	if *urlStr != "" {
-		if strings.Contains(*urlStr, "*") {
-			fmt.Printf(Yellow("ORIGINAL URL: %s\n"), *urlStr)
-			noStarURL := strings.Replace(*urlStr, "*", "", -1)
-			statusCode, server, responseTime, err := fetchURL(noStarURL, *userAgent, *retries, *proxy)
-			if err != nil {
-				fmt.Println("Error fetching the URL:", err)
-				return
-			}
-			fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
-
-			nStars := strings.Count(*urlStr, "*")
-			for _, payload := range payloads {
-				for i := 0; i < nStars; i++ {
-					modifiedURL := *urlStr
-					starCount := 0
-
-					// Replace the ith '*' with the payload
-					for j := 0; j < len(modifiedURL); j++ {
-						if modifiedURL[j] == '*' {
-							if starCount == i {
-								modifiedURL = modifiedURL[:j] + payload + modifiedURL[j+1:]
-
-								break
-							}
-							starCount++
-						}
-					}
-					noModifiedStarURL := strings.Replace(modifiedURL, "*", "", -1)
-					statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries, *proxy)
-					if err != nil {
-						fmt.Println("Error fetching the URL:", err)
-						continue
-					}
-
-					// Adding output in a empty variable
-					outputStr := ""
-					if responseTime > float64(*responseFlag) {
-						if *noColor {
-							outputStr = fmt.Sprintf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", noModifiedStarURL, statusCode, server, responseTime)
-						} else {
-							outputStr = fmt.Sprintf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), noModifiedStarURL, statusCode, server, responseTime)
-						}
-						fmt.Print(outputStr) // Print to the terminal
-						if output != nil {
-							output.WriteString(outputStr) // Save to the output file
-						}
-
-						if *verify > 1 {
-							responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy, *requiredCount)
-							if err != nil {
-								fmt.Println("Error verifying the URL:", err)
-								continue
-							}
-							if isVerified {
-								if *noColor {
-									outputStr = fmt.Sprintf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", noModifiedStarURL, statusCode, server, responseTimesSummary)
-								} else {
-									outputStr = fmt.Sprintf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), noModifiedStarURL, statusCode, server, responseTimesSummary)
-								}
-
-								fmt.Print(outputStr)
-								if output != nil {
-									output.WriteString(outputStr)
-								}
-
-								// Call the discord function with the loaded webhookURL and messageContent
-								if *sendToDiscord && config != nil {
-									// The message content
-									messageContent := fmt.Sprintf("```SQLI CONFIRMED: %s [%d] [%s] [%s]```\n", noModifiedStarURL, statusCode, server, responseTimesSummary)
-									discord(config.Discord.WebhookURL, messageContent)
-								}
-
-								sqlFoundCount++ // Increment the counter
-								if *stop > 0 && sqlFoundCount >= *stop {
-									fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), *urlStr)
-
-									if *integratecmd != "" {
-										if *icoutput {
-											// Generate a unique session name
-											sessionName := generateUniqueSessionName("integratecmdSession")
-
-											// This code will create the integratecmdSessionOutput directory if it doesn't already exist
-										    err := os.MkdirAll("integratecmdSessionOutput", os.ModePerm)
-										    if err != nil {
-										        fmt.Println("Error creating directory:", err)
-										        return
-										    }
-
-											// Prepare the echo command
-											echoCmdStr := fmt.Sprintf("echo Running ghauri: %s | tee -a integratecmdSessionOutput/%s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
-
-											// Prepare the ghauri command with the URL in double quotes and run it via tmux
-											ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
-
-											// Prepare the ghauri finished command
-											ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s | tee -a integratecmdSessionOutput/%s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
-
-											// Combine the ghauri command with unbuffer and save them output via tee command, using sessionName.log
-											combinedCmdStr := fmt.Sprintf("%s && unbuffer %s | tee -a integratecmdSessionOutput/%s.log && %s", echoCmdStr, ghauriCmdStr, sessionName, ghauriFinished)
-
-											// Wrap the ghauri command in a tmux command with the unique session name
-											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
-
-											runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
-											fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
-											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
-
-											// Run the tmux command with bash
-											cmd := exec.Command("bash", "-c", tmuxCmdStr)
-											cmd.Stdout = os.Stdout
-											cmd.Stderr = os.Stderr
-											if err := cmd.Run(); err != nil {
-												fmt.Printf("Error running ghauri command in tmux: %s\n", err)
-											}
-										} else {
-											// Generate a unique session name
-											sessionName := generateUniqueSessionName("integratecmdSession")
-
-											// Prepare the echo command
-											echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
-
-											// Prepare the ghauri command with the URL in double quotes and run it via tmux
-											ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
-
-											// Prepare the ghauri finished command
-											ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
-
-											// Combine all commands
-											combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
-
-											// Wrap the ghauri command in a tmux command with the unique session name
-											tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
-
-											runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
-											fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
-											fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
-
-											// Run the tmux command with bash
-											cmd := exec.Command("bash", "-c", tmuxCmdStr)
-											cmd.Stdout = os.Stdout
-											cmd.Stderr = os.Stderr
-											if err := cmd.Run(); err != nil {
-												fmt.Printf("Error running ghauri command in tmux: %s\n", err)
-											}
-										}
-									}
-									break // Exit the payload loop for the current URL
-								}
-							} else {
-								fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), noModifiedStarURL, statusCode, server, responseTimesSummary)
-							}
-						}
-					} else {
-						fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), noModifiedStarURL, statusCode, server, responseTime)
-					}
-					fmt.Print(outputStr)
-					if output != nil {
-						output.WriteString(outputStr)
-					}
-				}
-				if *stop > 0 && sqlFoundCount >= *stop {
-					break // Break out of the main URL loop if stop condition is met
-				}
-			}
-		}
-	} else if *list != "" {
-		file, err := os.Open(*list)
-		if err != nil {
-			fmt.Println("Error opening the file:", err)
-			return
-		}
-		defer file.Close()
-
-		NORMALREQUEST := ""
-		FalseStatusCodeCheck := ""
-		
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			urlStr := scanner.Text()
-			if strings.Contains(urlStr, "*") {
-				originalURL := urlStr
-				fmt.Printf(Yellow("ORIGINAL URL: %s\n"), originalURL)
-				noStarURL := strings.Replace(urlStr, "*", "", -1)
-				statusCode, server, responseTime, err := fetchURL(noStarURL, *userAgent, *retries, *proxy)
-				if err != nil {
-					fmt.Println("Error fetching the URL:", err)
-					continue
-				}
-				fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
-				
-				NORMALREQUEST = fmt.Sprintf(Yellow("WITHOUT SQLI PAYLOAD NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), noStarURL, statusCode, server, responseTime)
-				FalseStatusCodeCheck = fmt.Sprintf("%d", statusCode)
-
-				starIndexes := []int{}
-				for i := 0; i < len(urlStr); i++ {
-					if urlStr[i] == '*' {
-						starIndexes = append(starIndexes, i)
-					}
-				}
-
-				stopProcessing := false
-
-				for _, payload := range payloads {
-					for _, index := range starIndexes {
-						if stopProcessing {
-							break
-						}
-
-						modifiedURL := urlStr[:index] + payload + urlStr[index+1:]
-
-						noModifiedStarURL := strings.Replace(modifiedURL, "*", "", -1)
-						statusCode, server, responseTime, err := fetchURL(noModifiedStarURL, *userAgent, *retries, *proxy)
-						if err != nil {
-							fmt.Println("Error fetching the URL:", err)
-							continue
-						}
-
-						// Check if status code is 403
-						if statusCode == 403 {
-							forbiddenCount++
-							if forbiddenCount > *maxsca {
-								domain := extractDomain(urlStr)
-								
-								falseStatusCode, err := strconv.Atoi(FalseStatusCodeCheck)
-								if err != nil {
-								    fmt.Println("Error converting FalseStatusCodeCheck to int:", err)
-								    continue
-								}
-
-								// Checking falseStatusCode and statusCode is both returning 403 then Skip all remaining URLs for that DOMAIN, sometime website return 403 because of sqli payload but without sqli payload is 200, that is here we checking.
-								if falseStatusCode == statusCode {
-									fmt.Printf(Magenta("Skipping remaining URLs: for this DOMAIN (%s) due to 403 response limit reached -maxsca.\n"), domain)
-									break
-								} else {
-									if *verbose {
-										fmt.Print(NORMALREQUEST)
-									}
-								}
-							}
-						}
-
-						outputStr := ""
-						if responseTime > float64(*responseFlag) {
-							if *noColor {
-								outputStr = fmt.Sprintf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", noModifiedStarURL, statusCode, server, responseTime)
-							} else {
-								outputStr = fmt.Sprintf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), noModifiedStarURL, statusCode, server, responseTime)
-							}
-							fmt.Print(outputStr)
-							if output != nil {
-								output.WriteString(outputStr)
-							}
-
-							if *verify > 1 {
-								responseTimesSummary, isVerified, err := verifyURL(noModifiedStarURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *proxy, *requiredCount)
-								if err != nil {
-									fmt.Println("Error verifying the URL:", err)
-									continue
-								}
-								if isVerified {
-									if *noColor {
-										outputStr = fmt.Sprintf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", noModifiedStarURL, statusCode, server, responseTimesSummary)
-									} else {
-										outputStr = fmt.Sprintf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), noModifiedStarURL, statusCode, server, responseTimesSummary)
-									}
-
-									fmt.Print(outputStr)
-									if output != nil {
-										output.WriteString(outputStr)
-									}
-
-									if *sendToDiscord && config != nil {
-										messageContent := fmt.Sprintf("```SQLI CONFIRMED: %s [%d] [%s] [%s]```\n", noModifiedStarURL, statusCode, server, responseTimesSummary)
-										discord(config.Discord.WebhookURL, messageContent)
-									}
-
-									sqlFoundCount++
-									if *stop > 0 && sqlFoundCount >= *stop {
-										fmt.Printf(Cyan("Stopping further checks for this URL (%s) due to -stop flag.\n"), urlStr)
-
-										if *integratecmd != "" {
-
-											if *icoutput {
-												// Generate a unique session name
-												sessionName := generateUniqueSessionName("integratecmdSession")
-
-												// This code will create the integratecmdSessionOutput directory if it doesn't already exist
-											    err := os.MkdirAll("integratecmdSessionOutput", os.ModePerm)
-											    if err != nil {
-											        fmt.Println("Error creating directory:", err)
-											        return
-											    }
-
-												// Prepare the echo command
-												echoCmdStr := fmt.Sprintf("echo Running ghauri: %s | tee -a integratecmdSessionOutput/%s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
-
-												// Prepare the ghauri command with the URL in double quotes and run it via tmux
-												ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
-
-												// Prepare the ghauri finished command
-												ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s | tee -a integratecmdSessionOutput/%s.log", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), sessionName)
-
-												// Combine the ghauri command with unbuffer and save them output via tee command, using sessionName.log
-												combinedCmdStr := fmt.Sprintf("%s && unbuffer %s | tee -a integratecmdSessionOutput/%s.log && %s", echoCmdStr, ghauriCmdStr, sessionName, ghauriFinished)
-
-												// Wrap the ghauri command in a tmux command with the unique session name
-												tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
-
-												runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
-												fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
-												fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
-
-												// Run the tmux command with bash
-												cmd := exec.Command("bash", "-c", tmuxCmdStr)
-												cmd.Stdout = os.Stdout
-												cmd.Stderr = os.Stderr
-												if err := cmd.Run(); err != nil {
-													fmt.Printf("Error running ghauri command in tmux: %s\n", err)
-												}
-											} else {
-												// Generate a unique session name
-												sessionName := generateUniqueSessionName("integratecmdSession")
-
-												// Prepare the echo command
-												echoCmdStr := fmt.Sprintf("echo Running ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
-
-												// Prepare the ghauri command with the URL in double quotes and run it via tmux
-												ghauriCmdStr := strings.Replace(*integratecmd, "{urlStr}", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL), -1)
-
-												// Prepare the ghauri finished command
-												ghauriFinished := fmt.Sprintf("echo Finished ghauri: %s", fmt.Sprintf("\\\"%s\\\"", noModifiedStarURL))
-
-												// Combine both commands
-												combinedCmdStr := fmt.Sprintf("%s && %s && %s", echoCmdStr, ghauriCmdStr, ghauriFinished)
-
-												// Wrap the ghauri command in a tmux command with the unique session name
-												tmuxCmdStr := fmt.Sprintf("tmux new-session -d -s %s 'bash -c \"%s\"; bash'", sessionName, combinedCmdStr)
-
-												runCmdStr := fmt.Sprintf("tmux new-session -d -s %s \"%s\"", sessionName, ghauriCmdStr)
-												fmt.Printf(Cyan("Running: %s\n"), runCmdStr)
-												fmt.Printf(Cyan("Attach tmux session: tmux a -t %s\n"), sessionName)
-
-												// Run the tmux command with bash
-												cmd := exec.Command("bash", "-c", tmuxCmdStr)
-												cmd.Stdout = os.Stdout
-												cmd.Stderr = os.Stderr
-												if err := cmd.Run(); err != nil {
-													fmt.Printf("Error running ghauri command in tmux: %s\n", err)
-												}
-											}
-										}
-
-										stopProcessing = true
-										break
-									}
-								} else {
-									fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), noModifiedStarURL, statusCode, server, responseTimesSummary)
-								}
-							}
-						} else {
-							fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), noModifiedStarURL, statusCode, server, responseTime)
-						}
-					}
-
-					if stopProcessing {
-						break
-					}
-				}
-			} else {
-				if *verbose {
-					fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), urlStr)
-				}
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			fmt.Println("Error reading the file:", err)
-		}
-
-	} else {
-		fmt.Println("Please provide either a URL with -u or a file with -list")
-	}
+    var mu sync.Mutex
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    sqlFoundCount := 0
+    stopOnce := &sync.Once{}
+
+    if *url != "" {
+        if strings.Contains(*url, "*") {
+            statusCode, server, responseTime, err := fetchURL(ctx, cancel, *url, *userAgent, *retries)
+            if err != nil {
+                fmt.Println("Error fetching the URL:", err)
+                return
+            }
+            nStarURL := strings.Replace(*url, "*", "", -1)
+            fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), nStarURL, statusCode, server, responseTime)
+
+            var payloadWg sync.WaitGroup
+            payloadSem := make(chan struct{}, *maxConcurrency)
+
+            for _, payload := range payloads {
+                select {
+                case <-ctx.Done():
+                    fmt.Println(Cyan("Stopping further payloads due to context cancellation."))
+                    return
+                default:
+                    payloadSem <- struct{}{}
+                    payloadWg.Add(1)
+                    go func(payload string) {
+                        defer func() { <-payloadSem }()
+                        defer payloadWg.Done()
+
+                        // Check if ADDTIME exists in the payload and replace it with 10
+                        if strings.Contains(payload, "ADDTIME") {
+                            payload = strings.Replace(payload, "ADDTIME", "10", -1)
+                        }
+
+                        modifiedURL := strings.Replace(*url, "*", payload, -1)
+                        statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, *userAgent, *retries)
+                        if err != nil {
+                            fmt.Println("Error fetching the URL:", err)
+                            return
+                        }
+
+                        if responseTime > float64(*responseFlag) {
+                            if *noColor {
+                                fmt.Printf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", modifiedURL, statusCode, server, responseTime)
+                            } else {
+                                fmt.Printf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+                            }
+
+                            if *verify > 1 {
+                                responseTimesSummary, isVerified, err := verifyURL(ctx, cancel, modifiedURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *requiredCount)
+                                if err != nil {
+                                    fmt.Println("Error verifying the URL:", err)
+                                    return
+                                }
+                                if isVerified {
+                                    mu.Lock()
+                                    defer mu.Unlock()
+
+                                    select {
+                                    case <-ctx.Done():
+                                        return
+                                    default:
+                                        if *noColor {
+                                            fmt.Printf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, responseTimesSummary)
+                                        } else {
+                                            fmt.Printf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
+                                        }
+
+                                        sqlFoundCount++
+                                        if *stop > 0 && sqlFoundCount >= *stop {
+                                            fmt.Println(Cyan("Stopping further checks for this DOMAIN due to stop flag."))
+                                            stopOnce.Do(cancel)
+                                        }
+                                        return
+                                    }
+                                } else {
+                                    fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
+                                }
+                            }
+                        } else {
+                            fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+                        }
+                    }(payload)
+                }
+            }
+            payloadWg.Wait()
+        }
+    } else if *list != "" {
+        file, err := os.Open(*list)
+        if err != nil {
+            fmt.Println("Error opening the file:", err)
+            return
+        }
+        defer file.Close()
+
+        scanner := bufio.NewScanner(file)
+        var wg sync.WaitGroup
+        sem := make(chan struct{}, *maxParallel)
+
+        for scanner.Scan() {
+            url := scanner.Text()
+            if strings.Contains(url, "*") {
+                sem <- struct{}{}
+                wg.Add(1)
+                go func(url string) {
+                    defer func() { <-sem }()
+
+                    // Create a new context and cancel function for each URL
+                    ctx, cancel := context.WithCancel(context.Background())
+                    stopOnce := &sync.Once{} // Reset stopOnce for each URL
+                    processURL(ctx, cancel, url, payloads, *responseFlag, *verify, *verifyDelay, *retries, *noColor, *userAgent, *stop, &wg, &mu, stopOnce, *maxConcurrency, *requiredCount)
+                }(url)
+            } else {
+                fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), url)
+            }
+        }
+        wg.Wait()
+
+        if err := scanner.Err(); err != nil {
+            fmt.Println("Error reading the file:", err)
+        }
+    } else {
+        fmt.Println("Please provide either a URL with -u or a file with -list")
+    }
 }

@@ -1,4 +1,0 @@
-http://testphp.vulnweb.com/AJAX/infocateg.php?id=1*
-https://workbook-oct-uat.3300.aws.thomsonreuters.com/index.php?pp=tdf*&view=gfe*
-http://testphp.vulnweb.com/artists.php?artist=1*
-http://souslesmers.free.fr/f.php?e=266*
