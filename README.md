@@ -77,3 +77,6 @@ Oneliner:
 ▶ echo "testphp.vulnweb.com" | waybackurls | urldedupe -s | pvreplace -silent -payload "*" -fuzzing-part param-value -fuzzing-type replace -fuzzing-mode single | unew -ef -el -t -i -q urls.txt
 ▶ gosqli -list urls.txt -payload payloads/generic.txt | tee -a gosqli.txt
 ```
+
+## Output:
+![image](https://github.com/user-attachments/assets/8738fa35-51ac-4ed4-a2d2-8cb65369bbae)
