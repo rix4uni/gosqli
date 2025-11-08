@@ -1,8 +1,11 @@
 module github.com/rix4uni/gosqli
 
-go 1.23.4
+go 1.25.1
 
-require github.com/fatih/color v1.18.0
+require (
+	github.com/fatih/color v1.18.0
+	github.com/spf13/pflag v1.0.10
+)
 
 require (
 	github.com/mattn/go-colorable v0.1.13 // indirect
