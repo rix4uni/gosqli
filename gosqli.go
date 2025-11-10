@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,11 +53,17 @@ func fetchURLWithRequest(ctx context.Context, cancel context.CancelFunc, targetU
 	var server string
 	var responseTime float64
 
-	// Custom HTTP Transport to disable HTTP/2
+	// Custom HTTP Transport to disable HTTP/2 and handle TLS/IP issues
 	transport := &http.Transport{
-		TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
+		TLSNextProto:      make(map[string]func(string, *tls.Conn) http.RoundTripper),
+		DialContext:       (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
 	}
-	client := &http.Client{Transport: transport}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}
 
 	// Determine method
 	if method == "" {
