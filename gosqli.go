@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -12,9 +13,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/fatih/color"
 
 	"github.com/rix4uni/gosqli/banner"
@@ -27,9 +28,6 @@ var Green = color.New(color.FgGreen).SprintFunc()
 var Yellow = color.New(color.FgYellow).SprintFunc()
 var Magenta = color.New(color.FgMagenta).SprintFunc()
 var Cyan = color.New(color.FgCyan).SprintFunc()
-
-// Package-level mutex for file operations
-var fileMutex sync.Mutex
 
 // HTTPRequest represents a parsed HTTP request
 type HTTPRequest struct {
@@ -133,37 +131,46 @@ func fetchURLWithRequest(ctx context.Context, cancel context.CancelFunc, targetU
 	return statusCode, server, responseTime, lastErr
 }
 
-func verifyURL(ctx context.Context, cancel context.CancelFunc, url string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, requiredCount int) (string, bool, error) {
-	return verifyURLWithRequest(ctx, cancel, url, "", nil, "", verifyCount, responseFlag, verifyDelay, userAgent, retries, requiredCount)
+func verifyURL(ctx context.Context, cancel context.CancelFunc, url string, verifyCount int, userAgent string, retries int, noColor bool) (int, bool, error) {
+	return verifyURLWithRequest(ctx, cancel, url, "", nil, "", verifyCount, userAgent, retries, noColor)
 }
 
-func verifyURLWithRequest(ctx context.Context, cancel context.CancelFunc, targetURL string, method string, headers map[string]string, body string, verifyCount int, responseFlag float64, verifyDelay float64, userAgent string, retries int, requiredCount int) (string, bool, error) {
-	var responseTimes []float64
+func verifyURLWithRequest(ctx context.Context, cancel context.CancelFunc, targetURL string, method string, headers map[string]string, body string, verifyCount int, userAgent string, retries int, noColor bool) (int, bool, error) {
+	passedCount := 0
 	for i := 0; i < verifyCount; i++ {
 		_, _, responseTime, err := fetchURLWithRequest(ctx, cancel, targetURL, userAgent, method, headers, retries, body)
 		if err != nil {
-			return "", false, err
+			return 0, false, err
 		}
-		responseTimes = append(responseTimes, responseTime)
-		time.Sleep(time.Duration(verifyDelay) * time.Millisecond)
-	}
 
-	var countGreaterThanFlag int
-	for _, rt := range responseTimes {
-		if rt > responseFlag {
-			countGreaterThanFlag++
+		passed := responseTime > 10.0
+		if passed {
+			passedCount++
+		}
+
+		// Tree connector: ├── for intermediate, └── for last
+		connector := "├──"
+		if i == verifyCount-1 {
+			connector = "└──"
+		}
+
+		if passed {
+			if noColor {
+				fmt.Printf("   %s [%d/%d] Verify: %.2f s ✓\n", connector, i+1, verifyCount, responseTime)
+			} else {
+				fmt.Printf(Red("   %s [%d/%d] Verify: %.2f s ✓\n"), connector, i+1, verifyCount, responseTime)
+			}
+		} else {
+			if noColor {
+				fmt.Printf("   %s [%d/%d] Verify: %.2f s ✗\n", connector, i+1, verifyCount, responseTime)
+			} else {
+				fmt.Printf(Green("   %s [%d/%d] Verify: %.2f s ✗\n"), connector, i+1, verifyCount, responseTime)
+			}
 		}
 	}
 
-	isVerified := requiredCount == 0 && len(responseTimes) > 0 && countGreaterThanFlag == len(responseTimes) || requiredCount > 0 && countGreaterThanFlag >= requiredCount
-
-	var responseTimesStr []string
-	for _, rt := range responseTimes {
-		responseTimesStr = append(responseTimesStr, fmt.Sprintf("%.2f s", rt))
-	}
-	responseTimesSummary := strings.Join(responseTimesStr, ", ")
-
-	return responseTimesSummary, isVerified, nil
+	isVerified := verifyCount > 0 && passedCount == verifyCount
+	return passedCount, isVerified, nil
 }
 
 func parseHTTPRequest(filepath string) (*HTTPRequest, error) {
@@ -293,6 +300,102 @@ func replaceInjectionMarker(req *HTTPRequest, payload string) (*HTTPRequest, err
 	return newReq, nil
 }
 
+// findInjectionPoints returns human-readable descriptions of where * markers are located in an HTTPRequest
+func findInjectionPoints(httpReq *HTTPRequest) []string {
+	var points []string
+
+	parsedURL, err := url.Parse(httpReq.URL)
+	if err == nil {
+		if strings.Contains(parsedURL.Path, "*") {
+			points = append(points, fmt.Sprintf("%s parameter (URL path)", httpReq.Method))
+		}
+		for key, values := range parsedURL.Query() {
+			for _, v := range values {
+				if strings.Contains(v, "*") {
+					points = append(points, fmt.Sprintf("%s parameter '%s'", httpReq.Method, key))
+				}
+			}
+		}
+	}
+
+	if httpReq.Body != "" && strings.Contains(httpReq.Body, "*") {
+		bodyParams := strings.Split(httpReq.Body, "&")
+		for _, param := range bodyParams {
+			kv := strings.SplitN(param, "=", 2)
+			if len(kv) == 2 && strings.Contains(kv[1], "*") {
+				points = append(points, fmt.Sprintf("%s parameter '%s'", httpReq.Method, kv[0]))
+			} else if len(kv) == 1 && strings.Contains(kv[0], "*") {
+				points = append(points, fmt.Sprintf("%s body", httpReq.Method))
+			}
+		}
+		if len(points) == 0 {
+			points = append(points, fmt.Sprintf("%s body (custom)", httpReq.Method))
+		}
+	}
+
+	for key, value := range httpReq.Headers {
+		if headerHasMarker(value) {
+			parts := strings.Split(key, "-")
+			for i, part := range parts {
+				if len(part) > 0 {
+					parts[i] = strings.ToUpper(part[:1]) + part[1:]
+				}
+			}
+			headerName := strings.Join(parts, "-")
+			points = append(points, fmt.Sprintf("Header '%s'", headerName))
+		}
+	}
+
+	return points
+}
+
+// headerHasMarker ignores */* MIME wildcards and reports true only for standalone * injection markers.
+func headerHasMarker(value string) bool {
+	stripped := strings.ReplaceAll(value, "*/*", "")
+	return strings.Contains(stripped, "*")
+}
+
+// headerCountMarkers counts standalone * injection markers, ignoring */* MIME wildcards.
+func headerCountMarkers(value string) int {
+	stripped := strings.ReplaceAll(value, "*/*", "")
+	return strings.Count(stripped, "*")
+}
+
+// findURLInjectionPoints returns descriptions of where * markers are in a URL string
+func findURLInjectionPoints(rawURL string) []string {
+	var points []string
+
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		if strings.Contains(rawURL, "*") {
+			points = append(points, "URL")
+		}
+		return points
+	}
+
+	if strings.Contains(parsedURL.Path, "*") {
+		points = append(points, "URL path")
+	}
+
+	for key, values := range parsedURL.Query() {
+		for _, v := range values {
+			if strings.Contains(v, "*") {
+				points = append(points, fmt.Sprintf("GET parameter '%s'", key))
+			}
+		}
+	}
+
+	return points
+}
+
+// truncatePayload returns a shortened version of the payload for display
+func truncatePayload(payload string, maxLen int) string {
+	if len(payload) <= maxLen {
+		return payload
+	}
+	return payload[:maxLen] + "..."
+}
+
 // isDirectory checks if the given path is a directory
 func isDirectory(path string) bool {
 	info, err := os.Stat(path)
@@ -340,11 +443,50 @@ func getConfigDir() (string, error) {
 	return configDir, nil
 }
 
+// ensureDefaultPayloadFile checks if the default payload file exists at ~/.config/gosqli/fav-time-based-sqli.txt
+// If not, it downloads it from GitHub. Returns the file path.
+func ensureDefaultPayloadFile() (string, error) {
+	configDir, err := getConfigDir()
+	if err != nil {
+		return "", err
+	}
+	payloadPath := filepath.Join(configDir, "fav-time-based-sqli.txt")
+
+	// Check if file already exists
+	if _, err := os.Stat(payloadPath); err == nil {
+		return payloadPath, nil
+	}
+
+	// Download from GitHub
+	downloadURL := "https://raw.githubusercontent.com/rix4uni/WordList/refs/heads/main/payloads/sqli/fav-time-based-sqli.txt"
+	fmt.Printf(Cyan("Downloading default payload file from: %s\n"), downloadURL)
+
+	resp, err := http.Get(downloadURL)
+	if err != nil {
+		return "", fmt.Errorf("error downloading default payload file: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("error downloading default payload file: HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading downloaded payload file: %v", err)
+	}
+
+	err = os.WriteFile(payloadPath, body, 0644)
+	if err != nil {
+		return "", fmt.Errorf("error saving default payload file: %v", err)
+	}
+
+	fmt.Printf(Cyan("Default payload file saved to: %s\n"), payloadPath)
+	return payloadPath, nil
+}
+
 // saveConfirmedURL saves both URL versions: modifiedURL (with payload) to burpsuite file and originalURL (with * marker) to sqlmap_ghauri file
 func saveConfirmedURL(modifiedURL string, originalURL string) error {
-	fileMutex.Lock()
-	defer fileMutex.Unlock()
-
 	configDir, err := getConfigDir()
 	if err != nil {
 		return err
@@ -436,9 +578,6 @@ func httpRequestToRaw(req *HTTPRequest) string {
 // saveConfirmedRequest saves a confirmed SQLI HTTP request to the appropriate directory
 // Returns the saved file path for sqlmap/ghauri directory (when withPayload is false)
 func saveConfirmedRequest(req *HTTPRequest, originalReq *HTTPRequest, filename string, withPayload bool) (string, error) {
-	fileMutex.Lock()
-	defer fileMutex.Unlock()
-
 	configDir, err := getConfigDir()
 	if err != nil {
 		return "", err
@@ -499,7 +638,31 @@ func getLogFilePath(tool string) string {
 	return filepath.Join(logsDir, fmt.Sprintf("%s_%s.log", tool, timestamp))
 }
 
-// launchSqlmap launches sqlmap as a background process
+// runCommandWithPTY runs a command with a pseudo-terminal to preserve colored output,
+// writing output to both the terminal and a log file. Falls back to pipe-based approach if PTY is unavailable.
+func runCommandWithPTY(name string, args []string, logFileHandle *os.File) error {
+	cmd := exec.Command(name, args...)
+
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		// PTY failed, retry with pipe-based approach (colors may not be preserved)
+		cmd = exec.Command(name, args...)
+		multiOut := io.MultiWriter(os.Stdout, logFileHandle)
+		multiErr := io.MultiWriter(os.Stderr, logFileHandle)
+		cmd.Stdout = multiOut
+		cmd.Stderr = multiErr
+		return cmd.Run()
+	}
+	defer ptmx.Close()
+
+	// Copy PTY output (with ANSI colors) to both terminal and log file
+	multiOut := io.MultiWriter(os.Stdout, logFileHandle)
+	io.Copy(multiOut, ptmx)
+
+	return cmd.Wait()
+}
+
+// launchSqlmap runs sqlmap in the foreground, outputting to both terminal and log file
 func launchSqlmap(target string, isRequestFile bool, logFile string) error {
 	var args []string
 	if isRequestFile {
@@ -512,9 +675,9 @@ func launchSqlmap(target string, isRequestFile bool, logFile string) error {
 	if err != nil {
 		return fmt.Errorf("error creating log file: %v", err)
 	}
+	defer logFileHandle.Close()
 
 	// Write header to log file indicating the target
-	// For request files, show just the filename; for URLs, show the full URL
 	headerTarget := target
 	if isRequestFile {
 		headerTarget = filepath.Base(target)
@@ -522,33 +685,18 @@ func launchSqlmap(target string, isRequestFile bool, logFile string) error {
 	header := fmt.Sprintf("URL_FILE: %s\n\n", headerTarget)
 	_, err = logFileHandle.WriteString(header)
 	if err != nil {
-		logFileHandle.Close()
 		return fmt.Errorf("error writing header to log file: %v", err)
 	}
 
-	// Don't close the file handle - let the process manage it
-	// The file will be closed when the process exits
-
-	cmd := exec.Command("sqlmap", args...)
-	cmd.Stdout = logFileHandle
-	cmd.Stderr = logFileHandle
-
-	err = cmd.Start()
+	err = runCommandWithPTY("sqlmap", args, logFileHandle)
 	if err != nil {
-		logFileHandle.Close()
-		return fmt.Errorf("error starting sqlmap: %v", err)
+		return fmt.Errorf("error running sqlmap: %v", err)
 	}
-
-	// Detach from the process - don't wait for it
-	go func() {
-		cmd.Wait()
-		logFileHandle.Close()
-	}()
 
 	return nil
 }
 
-// launchGhauri launches ghauri as a background process
+// launchGhauri runs ghauri in the foreground, outputting to both terminal and log file
 func launchGhauri(target string, isRequestFile bool, logFile string) error {
 	var args []string
 	if isRequestFile {
@@ -561,9 +709,9 @@ func launchGhauri(target string, isRequestFile bool, logFile string) error {
 	if err != nil {
 		return fmt.Errorf("error creating log file: %v", err)
 	}
+	defer logFileHandle.Close()
 
 	// Write header to log file indicating the target
-	// For request files, show just the filename; for URLs, show the full URL
 	headerTarget := target
 	if isRequestFile {
 		headerTarget = filepath.Base(target)
@@ -571,28 +719,13 @@ func launchGhauri(target string, isRequestFile bool, logFile string) error {
 	header := fmt.Sprintf("URL_FILE: %s\n\n", headerTarget)
 	_, err = logFileHandle.WriteString(header)
 	if err != nil {
-		logFileHandle.Close()
 		return fmt.Errorf("error writing header to log file: %v", err)
 	}
 
-	// Don't close the file handle - let the process manage it
-	// The file will be closed when the process exits
-
-	cmd := exec.Command("ghauri", args...)
-	cmd.Stdout = logFileHandle
-	cmd.Stderr = logFileHandle
-
-	err = cmd.Start()
+	err = runCommandWithPTY("ghauri", args, logFileHandle)
 	if err != nil {
-		logFileHandle.Close()
-		return fmt.Errorf("error starting ghauri: %v", err)
+		return fmt.Errorf("error running ghauri: %v", err)
 	}
-
-	// Detach from the process - don't wait for it
-	go func() {
-		cmd.Wait()
-		logFileHandle.Close()
-	}()
 
 	return nil
 }
@@ -607,11 +740,12 @@ func launchExploitation(target string, isRequestFile bool, tool string) error {
 		if logFile == "" {
 			return fmt.Errorf("error getting log file path")
 		}
+		fmt.Printf(Cyan("Running sqlmap exploitation. Log: %s\n"), logFile)
 		err := launchSqlmap(target, isRequestFile, logFile)
 		if err != nil {
 			return err
 		}
-		fmt.Printf(Cyan("Started sqlmap exploitation in background. Log: %s\n"), logFile)
+		fmt.Printf(Cyan("Finished sqlmap exploitation. Log: %s\n"), logFile)
 		return nil
 
 	case "ghauri":
@@ -619,35 +753,38 @@ func launchExploitation(target string, isRequestFile bool, tool string) error {
 		if logFile == "" {
 			return fmt.Errorf("error getting log file path")
 		}
+		fmt.Printf(Cyan("Running ghauri exploitation. Log: %s\n"), logFile)
 		err := launchGhauri(target, isRequestFile, logFile)
 		if err != nil {
 			return err
 		}
-		fmt.Printf(Cyan("Started ghauri exploitation in background. Log: %s\n"), logFile)
+		fmt.Printf(Cyan("Finished ghauri exploitation. Log: %s\n"), logFile)
 		return nil
 
 	case "both":
-		// Launch both tools
+		// Run both tools sequentially
 		sqlmapLogFile := getLogFilePath("sqlmap")
 		if sqlmapLogFile == "" {
 			return fmt.Errorf("error getting sqlmap log file path")
 		}
+		fmt.Printf(Cyan("Running sqlmap exploitation. Log: %s\n"), sqlmapLogFile)
 		err := launchSqlmap(target, isRequestFile, sqlmapLogFile)
 		if err != nil {
-			fmt.Printf(Yellow("Warning: Failed to start sqlmap: %v\n"), err)
+			fmt.Printf(Yellow("Warning: Failed to run sqlmap: %v\n"), err)
 		} else {
-			fmt.Printf(Cyan("Started sqlmap exploitation in background. Log: %s\n"), sqlmapLogFile)
+			fmt.Printf(Cyan("Finished sqlmap exploitation. Log: %s\n"), sqlmapLogFile)
 		}
 
 		ghauriLogFile := getLogFilePath("ghauri")
 		if ghauriLogFile == "" {
 			return fmt.Errorf("error getting ghauri log file path")
 		}
+		fmt.Printf(Cyan("Running ghauri exploitation. Log: %s\n"), ghauriLogFile)
 		err = launchGhauri(target, isRequestFile, ghauriLogFile)
 		if err != nil {
-			fmt.Printf(Yellow("Warning: Failed to start ghauri: %v\n"), err)
+			fmt.Printf(Yellow("Warning: Failed to run ghauri: %v\n"), err)
 		} else {
-			fmt.Printf(Cyan("Started ghauri exploitation in background. Log: %s\n"), ghauriLogFile)
+			fmt.Printf(Cyan("Finished ghauri exploitation. Log: %s\n"), ghauriLogFile)
 		}
 		return nil
 
@@ -738,9 +875,7 @@ func sendProxyRequest(ctx context.Context, targetURL string, userAgent string, p
 	fmt.Printf(Cyan("Proxy request sent: %s\n"), outputMsg)
 }
 
-func processURL(ctx context.Context, cancel context.CancelFunc, url string, payloads []string, responseFlag, verify, verifyDelay, retries int, noColor bool, userAgent string, stop int, wg *sync.WaitGroup, mu *sync.Mutex, stopOnce *sync.Once, maxConcurrency int, requiredCount int, proxy string, output bool, onConfirmed string) {
-	defer wg.Done()
-
+func processURL(ctx context.Context, cancel context.CancelFunc, url string, payloads []string, verify, retries int, noColor bool, userAgent string, stop int, proxy string, output bool, onConfirmed string) {
 	sqlFoundCount := 0 // Reset for each URL
 
 	statusCode, server, responseTime, err := fetchURL(ctx, cancel, url, userAgent, retries)
@@ -751,8 +886,11 @@ func processURL(ctx context.Context, cancel context.CancelFunc, url string, payl
 	nStarURL := strings.Replace(url, "*", "", -1)
 	fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), nStarURL, statusCode, server, responseTime)
 
-	var payloadWg sync.WaitGroup
-	payloadSem := make(chan struct{}, maxConcurrency)
+	// Show injection points
+	injPoints := findURLInjectionPoints(url)
+	for _, point := range injPoints {
+		fmt.Printf(Cyan("   [*] Injection point: %s\n"), point)
+	}
 
 	for _, payload := range payloads {
 		select {
@@ -760,97 +898,84 @@ func processURL(ctx context.Context, cancel context.CancelFunc, url string, payl
 			fmt.Println(Cyan("Stopping further payloads due to context cancellation."))
 			return
 		default:
-			payloadSem <- struct{}{}
-			payloadWg.Add(1)
-			go func(payload string) {
-				defer func() { <-payloadSem }()
-				defer payloadWg.Done()
+		}
 
-				// Replace ADDTIME in the payload with 10
-				payload = strings.Replace(payload, "ADDTIME", "10", -1)
+		// Replace ADDTIME in the payload with 10
+		payload = strings.Replace(payload, "ADDTIME", "10", -1)
 
-				modifiedURL := strings.Replace(url, "*", payload, -1)
-				statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, userAgent, retries)
+		modifiedURL := strings.Replace(url, "*", payload, -1)
+		statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, userAgent, retries)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return
+			}
+			fmt.Println("Error fetching the URL:", err)
+			continue
+		}
+
+		payloadDisplay := truncatePayload(payload, 60)
+		if responseTime > 10.0 {
+			if noColor {
+				fmt.Printf("SQLI FOUND: %s [%d] [%s] [%.2f s] [Payload: %s]\n", modifiedURL, statusCode, server, responseTime, payloadDisplay)
+			} else {
+				fmt.Printf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s] [Payload: %s]\n"), modifiedURL, statusCode, server, responseTime, payloadDisplay)
+			}
+
+			if verify > 1 {
+				passedCount, isVerified, err := verifyURL(ctx, cancel, modifiedURL, verify, userAgent, retries, noColor)
 				if err != nil {
 					if ctx.Err() == context.Canceled {
-						// Skip further processing if context is canceled
 						return
 					}
-					fmt.Println("Error fetching the URL:", err)
-					return
+					fmt.Println("Error verifying the URL:", err)
+					continue
 				}
-
-				if responseTime > float64(responseFlag) {
+				verifySummary := fmt.Sprintf("%d/%d passed", passedCount, verify)
+				if isVerified {
 					if noColor {
-						fmt.Printf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", modifiedURL, statusCode, server, responseTime)
+						fmt.Printf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, verifySummary)
 					} else {
-						fmt.Printf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+						fmt.Printf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, verifySummary)
 					}
 
-					if verify > 1 {
-						responseTimesSummary, isVerified, err := verifyURL(ctx, cancel, modifiedURL, verify, float64(responseFlag), float64(verifyDelay), userAgent, retries, requiredCount)
-						if err != nil {
-							if ctx.Err() == context.Canceled {
-								// Skip further processing if context is canceled
-								return
-							}
-							fmt.Println("Error verifying the URL:", err)
-							return
+					// Send request through proxy if configured
+					sendProxyRequest(ctx, modifiedURL, userAgent, proxy, nil, "", server, verifySummary)
+
+					// Save confirmed SQLI URL if output flag is enabled
+					if output {
+						if err := saveConfirmedURL(modifiedURL, url); err != nil {
+							fmt.Printf(Yellow("Warning: Failed to save confirmed URL: %v\n"), err)
 						}
-						if isVerified {
-							mu.Lock()
-							defer mu.Unlock()
+					}
 
-							select {
-							case <-ctx.Done():
-								return
-							default:
-								if noColor {
-									fmt.Printf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, responseTimesSummary)
-								} else {
-									fmt.Printf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
-								}
-
-								// Send request through proxy if configured
-								sendProxyRequest(ctx, modifiedURL, userAgent, proxy, nil, "", server, responseTimesSummary)
-
-								// Save confirmed SQLI URL if output flag is enabled
-								if output {
-									if err := saveConfirmedURL(modifiedURL, url); err != nil {
-										fmt.Printf(Yellow("Warning: Failed to save confirmed URL: %v\n"), err)
-									}
-								}
-
-								// Launch exploitation tool if on-confirmed flag is set
-								if onConfirmed != "" && onConfirmed != "none" {
-									if err := launchExploitation(modifiedURL, false, onConfirmed); err != nil {
-										fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
-									}
-								}
-
-								sqlFoundCount++ // No need to dereference
-								if stop > 0 && sqlFoundCount >= stop {
-									fmt.Println(Cyan("Stopping further checks for this URL due to stop flag."))
-									stopOnce.Do(cancel)
-									return
-								}
-							}
-						} else {
-							fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
+					// Launch exploitation tool if on-confirmed flag is set
+					if onConfirmed != "" && onConfirmed != "none" {
+						if err := launchExploitation(modifiedURL, false, onConfirmed); err != nil {
+							fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
 						}
+					}
+
+					sqlFoundCount++
+					if stop > 0 && sqlFoundCount >= stop {
+						fmt.Println(Cyan("Stopping further checks for this URL due to stop flag."))
+						cancel()
+						return
 					}
 				} else {
-					fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+					if noColor {
+						fmt.Printf("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, verifySummary)
+					} else {
+						fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, verifySummary)
+					}
 				}
-			}(payload)
+			}
+		} else {
+			fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s] [Payload: %s]\n"), modifiedURL, statusCode, server, responseTime, payloadDisplay)
 		}
 	}
-	payloadWg.Wait()
 }
 
-func processHTTPRequest(ctx context.Context, cancel context.CancelFunc, httpReq *HTTPRequest, payloads []string, responseFlag, verify, verifyDelay, retries int, noColor bool, stop int, wg *sync.WaitGroup, mu *sync.Mutex, stopOnce *sync.Once, maxConcurrency int, requiredCount int, proxy string, filename string, output bool, onConfirmed string) {
-	defer wg.Done()
-
+func processHTTPRequest(ctx context.Context, cancel context.CancelFunc, httpReq *HTTPRequest, payloads []string, verify, retries int, noColor bool, stop int, proxy string, filename string, output bool, onConfirmed string) {
 	sqlFoundCount := 0
 
 	// Make baseline request
@@ -862,8 +987,11 @@ func processHTTPRequest(ctx context.Context, cancel context.CancelFunc, httpReq 
 	nStarURL := strings.Replace(httpReq.URL, "*", "", -1)
 	fmt.Printf(Yellow("NORMAL REQUEST: [%s] %s [%d] [%s] [%.2f s]\n"), filename, nStarURL, statusCode, server, responseTime)
 
-	var payloadWg sync.WaitGroup
-	payloadSem := make(chan struct{}, maxConcurrency)
+	// Show injection points
+	injPoints := findInjectionPoints(httpReq)
+	for _, point := range injPoints {
+		fmt.Printf(Cyan("   [*] Injection point: %s\n"), point)
+	}
 
 	for _, payload := range payloads {
 		select {
@@ -871,132 +999,118 @@ func processHTTPRequest(ctx context.Context, cancel context.CancelFunc, httpReq 
 			fmt.Println(Cyan("Stopping further payloads due to context cancellation."))
 			return
 		default:
-			payloadSem <- struct{}{}
-			payloadWg.Add(1)
-			go func(payload string) {
-				defer func() { <-payloadSem }()
-				defer payloadWg.Done()
+		}
 
-				// Replace ADDTIME in the payload with 10
-				payload = strings.Replace(payload, "ADDTIME", "10", -1)
+		// Replace ADDTIME in the payload with 10
+		payload = strings.Replace(payload, "ADDTIME", "10", -1)
 
-				// Replace * with payload in request
-				modifiedReq, err := replaceInjectionMarker(httpReq, payload)
-				if err != nil {
-					fmt.Println("Error modifying request:", err)
-					return
-				}
+		// Replace * with payload in request
+		modifiedReq, err := replaceInjectionMarker(httpReq, payload)
+		if err != nil {
+			fmt.Println("Error modifying request:", err)
+			continue
+		}
 
-				statusCode, server, responseTime, err := fetchURLWithRequest(ctx, cancel, modifiedReq.URL, modifiedReq.UserAgent, modifiedReq.Method, modifiedReq.Headers, retries, modifiedReq.Body)
+		statusCode, server, responseTime, err := fetchURLWithRequest(ctx, cancel, modifiedReq.URL, modifiedReq.UserAgent, modifiedReq.Method, modifiedReq.Headers, retries, modifiedReq.Body)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return
+			}
+			fmt.Println("Error fetching the URL:", err)
+			continue
+		}
+
+		payloadDisplay := truncatePayload(payload, 60)
+		if responseTime > 10.0 {
+			if noColor {
+				fmt.Printf("SQLI FOUND: [%s] %s [%d] [%s] [%.2f s] [Payload: %s]\n", filename, modifiedReq.URL, statusCode, server, responseTime, payloadDisplay)
+			} else {
+				fmt.Printf(Red("SQLI FOUND: [%s] %s [%d] [%s] [%.2f s] [Payload: %s]\n"), filename, modifiedReq.URL, statusCode, server, responseTime, payloadDisplay)
+			}
+
+			if verify > 1 {
+				passedCount, isVerified, err := verifyURLWithRequest(ctx, cancel, modifiedReq.URL, modifiedReq.Method, modifiedReq.Headers, modifiedReq.Body, verify, modifiedReq.UserAgent, retries, noColor)
 				if err != nil {
 					if ctx.Err() == context.Canceled {
 						return
 					}
-					fmt.Println("Error fetching the URL:", err)
-					return
+					fmt.Println("Error verifying the URL:", err)
+					continue
 				}
-
-				if responseTime > float64(responseFlag) {
+				verifySummary := fmt.Sprintf("%d/%d passed", passedCount, verify)
+				if isVerified {
 					if noColor {
-						fmt.Printf("SQLI FOUND: [%s] %s [%d] [%s] [%.2f s]\n", filename, modifiedReq.URL, statusCode, server, responseTime)
+						fmt.Printf("SQLI CONFIRMED: [%s] %s [%d] [%s] [%s]\n", filename, modifiedReq.URL, statusCode, server, verifySummary)
 					} else {
-						fmt.Printf(Red("SQLI FOUND: [%s] %s [%d] [%s] [%.2f s]\n"), filename, modifiedReq.URL, statusCode, server, responseTime)
+						fmt.Printf(Red("SQLI CONFIRMED: [%s] %s [%d] [%s] [%s]\n"), filename, modifiedReq.URL, statusCode, server, verifySummary)
 					}
 
-					if verify > 1 {
-						responseTimesSummary, isVerified, err := verifyURLWithRequest(ctx, cancel, modifiedReq.URL, modifiedReq.Method, modifiedReq.Headers, modifiedReq.Body, verify, float64(responseFlag), float64(verifyDelay), modifiedReq.UserAgent, retries, requiredCount)
+					// Send request through proxy if configured
+					sendProxyRequest(ctx, modifiedReq.URL, modifiedReq.UserAgent, proxy, modifiedReq, filename, server, verifySummary)
+
+					// Save confirmed SQLI request to files if output flag is enabled or on-confirmed is set
+					var requestFilePath string
+					if output {
+						// Save request with payload for BurpSuite
+						_, err := saveConfirmedRequest(modifiedReq, httpReq, filename, true)
 						if err != nil {
-							if ctx.Err() == context.Canceled {
-								return
-							}
-							fmt.Println("Error verifying the URL:", err)
-							return
+							fmt.Printf(Yellow("Warning: Failed to save BurpSuite request: %v\n"), err)
 						}
-						if isVerified {
-							mu.Lock()
-							defer mu.Unlock()
+						// Save request with * marker for sqlmap/ghauri
+						requestFilePath, err = saveConfirmedRequest(modifiedReq, httpReq, filename, false)
+						if err != nil {
+							fmt.Printf(Yellow("Warning: Failed to save sqlmap/ghauri request: %v\n"), err)
+						}
+					} else if onConfirmed != "" && onConfirmed != "none" {
+						// Save request file for exploitation even if output flag is not set
+						var err error
+						requestFilePath, err = saveConfirmedRequest(modifiedReq, httpReq, filename, false)
+						if err != nil {
+							fmt.Printf(Yellow("Warning: Failed to save request file for exploitation: %v\n"), err)
+						}
+					}
 
-							select {
-							case <-ctx.Done():
-								return
-							default:
-								if noColor {
-									fmt.Printf("SQLI CONFIRMED: [%s] %s [%d] [%s] [%s]\n", filename, modifiedReq.URL, statusCode, server, responseTimesSummary)
-								} else {
-									fmt.Printf(Red("SQLI CONFIRMED: [%s] %s [%d] [%s] [%s]\n"), filename, modifiedReq.URL, statusCode, server, responseTimesSummary)
-								}
-
-								// Send request through proxy if configured
-								sendProxyRequest(ctx, modifiedReq.URL, modifiedReq.UserAgent, proxy, modifiedReq, filename, server, responseTimesSummary)
-
-								// Save confirmed SQLI request to files if output flag is enabled or on-confirmed is set
-								var requestFilePath string
-								if output {
-									// Save request with payload for BurpSuite
-									_, err := saveConfirmedRequest(modifiedReq, httpReq, filename, true)
-									if err != nil {
-										fmt.Printf(Yellow("Warning: Failed to save BurpSuite request: %v\n"), err)
-									}
-									// Save request with * marker for sqlmap/ghauri
-									requestFilePath, err = saveConfirmedRequest(modifiedReq, httpReq, filename, false)
-									if err != nil {
-										fmt.Printf(Yellow("Warning: Failed to save sqlmap/ghauri request: %v\n"), err)
-									}
-								} else if onConfirmed != "" && onConfirmed != "none" {
-									// Save request file for exploitation even if output flag is not set
-									var err error
-									requestFilePath, err = saveConfirmedRequest(modifiedReq, httpReq, filename, false)
-									if err != nil {
-										fmt.Printf(Yellow("Warning: Failed to save request file for exploitation: %v\n"), err)
-									}
-								}
-
-								// Launch exploitation tool if on-confirmed flag is set
-								if onConfirmed != "" && onConfirmed != "none" {
-									// Use request file path if available, otherwise use URL
-									if requestFilePath != "" {
-										if err := launchExploitation(requestFilePath, true, onConfirmed); err != nil {
-											fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
-										}
-									} else {
-										// Fallback to URL if request file wasn't saved
-										if err := launchExploitation(modifiedReq.URL, false, onConfirmed); err != nil {
-											fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
-										}
-									}
-								}
-
-								sqlFoundCount++
-								if stop > 0 && sqlFoundCount >= stop {
-									fmt.Println(Cyan("Stopping further checks for this URL due to stop flag."))
-									stopOnce.Do(cancel)
-									return
-								}
+					// Launch exploitation tool if on-confirmed flag is set
+					if onConfirmed != "" && onConfirmed != "none" {
+						// Use request file path if available, otherwise use URL
+						if requestFilePath != "" {
+							if err := launchExploitation(requestFilePath, true, onConfirmed); err != nil {
+								fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
 							}
 						} else {
-							fmt.Printf(Green("SQLI FP CONFIRMED: [%s] %s [%d] [%s] [%s]\n"), filename, modifiedReq.URL, statusCode, server, responseTimesSummary)
+							// Fallback to URL if request file wasn't saved
+							if err := launchExploitation(modifiedReq.URL, false, onConfirmed); err != nil {
+								fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
+							}
 						}
 					}
+
+					sqlFoundCount++
+					if stop > 0 && sqlFoundCount >= stop {
+						fmt.Println(Cyan("Stopping further checks for this URL due to stop flag."))
+						cancel()
+						return
+					}
 				} else {
-					fmt.Printf(Green("NOT FOUND: [%s] %s [%d] [%s] [%.2f s]\n"), filename, modifiedReq.URL, statusCode, server, responseTime)
+					if noColor {
+						fmt.Printf("SQLI FP CONFIRMED: [%s] %s [%d] [%s] [%s]\n", filename, modifiedReq.URL, statusCode, server, verifySummary)
+					} else {
+						fmt.Printf(Green("SQLI FP CONFIRMED: [%s] %s [%d] [%s] [%s]\n"), filename, modifiedReq.URL, statusCode, server, verifySummary)
+					}
 				}
-			}(payload)
+			}
+		} else {
+			fmt.Printf(Green("NOT FOUND: [%s] %s [%d] [%s] [%.2f s] [Payload: %s]\n"), filename, modifiedReq.URL, statusCode, server, responseTime, payloadDisplay)
 		}
 	}
-	payloadWg.Wait()
 }
 
 // Display flag values at the start of the program
-func PrintInfo(responseFlag, verify, requiredCount, verifyDelay, retries, stop, maxParallel, maxConcurrency int) {
+func PrintInfo(verify, retries, stop int) {
 	fmt.Println("-------------------------------------------")
-	fmt.Printf(" :: responseFlag    : %d\n", responseFlag)
 	fmt.Printf(" :: verify          : %d\n", verify)
-	fmt.Printf(" :: requiredCount   : %d\n", requiredCount)
-	fmt.Printf(" :: verifyDelay     : %d\n", verifyDelay)
 	fmt.Printf(" :: retries         : %d\n", retries)
 	fmt.Printf(" :: stop            : %d\n", stop)
-	fmt.Printf(" :: maxParallel     : %d\n", maxParallel)
-	fmt.Printf(" :: maxConcurrency  : %d\n", maxConcurrency)
 	fmt.Println("-------------------------------------------")
 }
 
@@ -1004,22 +1118,17 @@ func main() {
 	url := pflag.StringP("url", "u", "", "URL to fetch")
 	list := pflag.StringP("list", "l", "", "File containing list of URLs")
 	payloadFile := pflag.StringP("payload", "p", "", "File containing payloads")
-	responseFlag := pflag.IntP("mrt", "m", 10, "Match response time with specified response time in seconds.")
 	verify := pflag.IntP("verify", "v", 3, "Number of times to verify \"SQLI FOUND\".")
-	requiredCount := pflag.IntP("requiredCount", "c", 0, "Number of response times greater than responseFlag required for SQLI CONFIRMED (0 means all).")
-	verifyDelay := pflag.IntP("verifydelay", "d", 12000, "Delay in milliseconds between verify attempts.")
 	retries := pflag.Int("retries", 0, "Number of retry attempts for failed HTTP requests.")
 	noColor := pflag.Bool("no-color", false, "Do not save colored output.")
 	stop := pflag.Int("stop", 1, "Stop checking pending HTTP requests after [stop] (0: means check all).")
 	userAgent := pflag.String("H", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36", "Custom User-Agent header for HTTP requests.")
-	maxParallel := pflag.IntP("parallel", "P", 1, "Maximum number of URLs Scan Parallely.")
-	maxConcurrency := pflag.Int("concurrency", 20, "Maximum number of Payloads Scan concurrent.")
 	silent := pflag.Bool("silent", false, "Silent mode.")
 	versionFlag := pflag.Bool("version", false, "Print the version of the tool and exit.")
 	proxy := pflag.String("proxy", "", "Proxy URL. E.g. --proxy http://127.0.0.1:8080")
 	requestFile := pflag.StringP("request", "r", "", "Load HTTP request from a file")
 	output := pflag.BoolP("output", "o", false, "Save SQLI CONFIRMED results to files")
-	onConfirmed := pflag.String("on-confirmed", "ghauri", "Tool to use for exploitation: sqlmap, ghauri, both, or ghauri (default)")
+	onConfirmed := pflag.String("on-confirmed", "sqlmap", "Tool to use for exploitation: sqlmap, ghauri, both, or ghauri (default)")
 	pflag.Parse()
 
 	if *versionFlag {
@@ -1030,12 +1139,17 @@ func main() {
 
 	if !*silent {
 		banner.PrintBanner()
-		PrintInfo(*responseFlag, *verify, *requiredCount, *verifyDelay, *retries, *stop, *maxParallel, *maxConcurrency)
+		PrintInfo(*verify, *retries, *stop)
 	}
 
-	if *requiredCount > *verify {
-		fmt.Println(Red("Error: -requiredCount flag value cannot be greater than -verify flag value."))
-		os.Exit(1)
+	// If no payload file specified, use default from ~/.config/gosqli/fav-time-based-sqli.txt
+	if *payloadFile == "" {
+		defaultPath, err := ensureDefaultPayloadFile()
+		if err != nil {
+			fmt.Println("Error setting up default payload file:", err)
+			return
+		}
+		*payloadFile = defaultPath
 	}
 
 	var payloads []string
@@ -1087,20 +1201,13 @@ func main() {
 		// Will calculate after parsing request
 	}
 
-	var mu sync.Mutex
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sqlFoundCount := 0
-	stopOnce := &sync.Once{}
 
 	// Handle request file mode
 	if *requestFile != "" {
-		if len(payloads) == 0 {
-			fmt.Println(Red("Error: -payload flag is required when using -r flag"))
-			os.Exit(1)
-		}
-
 		// Check if path is directory or file
 		if isDirectory(*requestFile) {
 			// Handle directory: process all files in parallel
@@ -1122,7 +1229,7 @@ func main() {
 				// Check if request contains injection marker
 				hasMarker := strings.Contains(httpReq.URL, "*") || strings.Contains(httpReq.Body, "*")
 				for _, value := range httpReq.Headers {
-					if strings.Contains(value, "*") {
+					if headerHasMarker(value) {
 						hasMarker = true
 						break
 					}
@@ -1131,7 +1238,7 @@ func main() {
 				if hasMarker {
 					countStars := strings.Count(httpReq.URL, "*") + strings.Count(httpReq.Body, "*")
 					for _, value := range httpReq.Headers {
-						countStars += strings.Count(value, "*")
+						countStars += headerCountMarkers(value)
 					}
 					totalCombinations += countStars * len(payloads)
 				}
@@ -1144,46 +1251,33 @@ func main() {
 				os.Exit(1)
 			}
 
-			// Process all files in parallel
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, *maxParallel)
-
+			// Process all files sequentially
 			for _, filePath := range requestFiles {
-				sem <- struct{}{}
-				wg.Add(1)
-				go func(filePath string) {
-					defer func() { <-sem }()
+				httpReq, err := parseHTTPRequest(filePath)
+				if err != nil {
+					fmt.Printf(Yellow("Warning: Skipping invalid request file %s: %v\n"), filePath, err)
+					continue
+				}
 
-					httpReq, err := parseHTTPRequest(filePath)
-					if err != nil {
-						fmt.Printf(Yellow("Warning: Skipping invalid request file %s: %v\n"), filePath, err)
-						wg.Done()
-						return
+				// Check if request contains injection marker
+				hasMarker := strings.Contains(httpReq.URL, "*") || strings.Contains(httpReq.Body, "*")
+				for _, value := range httpReq.Headers {
+					if headerHasMarker(value) {
+						hasMarker = true
+						break
 					}
+				}
 
-					// Check if request contains injection marker
-					hasMarker := strings.Contains(httpReq.URL, "*") || strings.Contains(httpReq.Body, "*")
-					for _, value := range httpReq.Headers {
-						if strings.Contains(value, "*") {
-							hasMarker = true
-							break
-						}
-					}
+				if !hasMarker {
+					fmt.Printf(Cyan("Skipping request file (No * found): %s\n"), filePath)
+					continue
+				}
 
-					if !hasMarker {
-						fmt.Printf(Cyan("Skipping request file (No * found): %s\n"), filePath)
-						wg.Done()
-						return
-					}
-
-					// Create a new context and cancel function for each request file
-					ctx, cancel := context.WithCancel(context.Background())
-					stopOnce := &sync.Once{} // Reset stopOnce for each request file
-					filename := filepath.Base(filePath)
-					processHTTPRequest(ctx, cancel, httpReq, payloads, *responseFlag, *verify, *verifyDelay, *retries, *noColor, *stop, &wg, &mu, stopOnce, *maxConcurrency, *requiredCount, *proxy, filename, *output, *onConfirmed)
-				}(filePath)
+				// Create a new context and cancel function for each request file
+				fileCtx, fileCancel := context.WithCancel(context.Background())
+				filename := filepath.Base(filePath)
+				processHTTPRequest(fileCtx, fileCancel, httpReq, payloads, *verify, *retries, *noColor, *stop, *proxy, filename, *output, *onConfirmed)
 			}
-			wg.Wait()
 			return
 		} else {
 			// Handle single file (existing behavior)
@@ -1196,7 +1290,7 @@ func main() {
 			// Check if request contains injection marker
 			hasMarker := strings.Contains(httpReq.URL, "*") || strings.Contains(httpReq.Body, "*")
 			for _, value := range httpReq.Headers {
-				if strings.Contains(value, "*") {
+				if headerHasMarker(value) {
 					hasMarker = true
 					break
 				}
@@ -1210,18 +1304,15 @@ func main() {
 			// Calculate total combinations
 			countStars := strings.Count(httpReq.URL, "*") + strings.Count(httpReq.Body, "*")
 			for _, value := range httpReq.Headers {
-				countStars += strings.Count(value, "*")
+				countStars += headerCountMarkers(value)
 			}
 			totalCombinations = countStars * len(payloads)
 			if totalCombinations > 0 {
 				fmt.Printf(Cyan("Request Will be Scanning with * [%d]\n\n"), totalCombinations)
 			}
 
-			var wg sync.WaitGroup
-			wg.Add(1)
 			filename := filepath.Base(*requestFile)
-			processHTTPRequest(ctx, cancel, httpReq, payloads, *responseFlag, *verify, *verifyDelay, *retries, *noColor, *stop, &wg, &mu, stopOnce, *maxConcurrency, *requiredCount, *proxy, filename, *output, *onConfirmed)
-			wg.Wait()
+			processHTTPRequest(ctx, cancel, httpReq, payloads, *verify, *retries, *noColor, *stop, *proxy, filename, *output, *onConfirmed)
 			return
 		}
 	}
@@ -1236,8 +1327,11 @@ func main() {
 			nStarURL := strings.Replace(*url, "*", "", -1)
 			fmt.Printf(Yellow("NORMAL REQUEST: %s [%d] [%s] [%.2f s]\n"), nStarURL, statusCode, server, responseTime)
 
-			var payloadWg sync.WaitGroup
-			payloadSem := make(chan struct{}, *maxConcurrency)
+			// Show injection points
+			injPoints := findURLInjectionPoints(*url)
+			for _, point := range injPoints {
+				fmt.Printf(Cyan("   [*] Injection point: %s\n"), point)
+			}
 
 			for _, payload := range payloads {
 				select {
@@ -1245,84 +1339,75 @@ func main() {
 					fmt.Println(Cyan("Stopping further payloads due to context cancellation."))
 					return
 				default:
-					payloadSem <- struct{}{}
-					payloadWg.Add(1)
-					go func(payload string) {
-						defer func() { <-payloadSem }()
-						defer payloadWg.Done()
+				}
 
-						// Replace ADDTIME in the payload with 10
-						payload = strings.Replace(payload, "ADDTIME", "10", -1)
+				// Replace ADDTIME in the payload with 10
+				payload = strings.Replace(payload, "ADDTIME", "10", -1)
 
-						modifiedURL := strings.Replace(*url, "*", payload, -1)
-						statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, *userAgent, *retries)
+				modifiedURL := strings.Replace(*url, "*", payload, -1)
+				statusCode, server, responseTime, err := fetchURL(ctx, cancel, modifiedURL, *userAgent, *retries)
+				if err != nil {
+					fmt.Println("Error fetching the URL:", err)
+					continue
+				}
+
+				payloadDisplay := truncatePayload(payload, 60)
+				if responseTime > 10.0 {
+					if *noColor {
+						fmt.Printf("SQLI FOUND: %s [%d] [%s] [%.2f s] [Payload: %s]\n", modifiedURL, statusCode, server, responseTime, payloadDisplay)
+					} else {
+						fmt.Printf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s] [Payload: %s]\n"), modifiedURL, statusCode, server, responseTime, payloadDisplay)
+					}
+
+					if *verify > 1 {
+						passedCount, isVerified, err := verifyURL(ctx, cancel, modifiedURL, *verify, *userAgent, *retries, *noColor)
 						if err != nil {
-							fmt.Println("Error fetching the URL:", err)
-							return
+							fmt.Println("Error verifying the URL:", err)
+							continue
 						}
-
-						if responseTime > float64(*responseFlag) {
+						verifySummary := fmt.Sprintf("%d/%d passed", passedCount, *verify)
+						if isVerified {
 							if *noColor {
-								fmt.Printf("SQLI FOUND: %s [%d] [%s] [%.2f s]\n", modifiedURL, statusCode, server, responseTime)
+								fmt.Printf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, verifySummary)
 							} else {
-								fmt.Printf(Red("SQLI FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+								fmt.Printf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, verifySummary)
 							}
 
-							if *verify > 1 {
-								responseTimesSummary, isVerified, err := verifyURL(ctx, cancel, modifiedURL, *verify, float64(*responseFlag), float64(*verifyDelay), *userAgent, *retries, *requiredCount)
-								if err != nil {
-									fmt.Println("Error verifying the URL:", err)
-									return
+							// Send request through proxy if configured
+							sendProxyRequest(ctx, modifiedURL, *userAgent, *proxy, nil, "", server, verifySummary)
+
+							// Save confirmed SQLI URL if output flag is enabled
+							if *output {
+								if err := saveConfirmedURL(modifiedURL, *url); err != nil {
+									fmt.Printf(Yellow("Warning: Failed to save confirmed URL: %v\n"), err)
 								}
-								if isVerified {
-									mu.Lock()
-									defer mu.Unlock()
+							}
 
-									select {
-									case <-ctx.Done():
-										return
-									default:
-										if *noColor {
-											fmt.Printf("SQLI CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, responseTimesSummary)
-										} else {
-											fmt.Printf(Red("SQLI CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
-										}
-
-										// Send request through proxy if configured
-										sendProxyRequest(ctx, modifiedURL, *userAgent, *proxy, nil, "", server, responseTimesSummary)
-
-										// Save confirmed SQLI URL if output flag is enabled
-										if *output {
-											if err := saveConfirmedURL(modifiedURL, *url); err != nil {
-												fmt.Printf(Yellow("Warning: Failed to save confirmed URL: %v\n"), err)
-											}
-										}
-
-										// Launch exploitation tool if on-confirmed flag is set
-										if *onConfirmed != "" && *onConfirmed != "none" {
-											if err := launchExploitation(modifiedURL, false, *onConfirmed); err != nil {
-												fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
-											}
-										}
-
-										sqlFoundCount++
-										if *stop > 0 && sqlFoundCount >= *stop {
-											fmt.Println(Cyan("Stopping further checks for this DOMAIN due to stop flag."))
-											stopOnce.Do(cancel)
-										}
-										return
-									}
-								} else {
-									fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, responseTimesSummary)
+							// Launch exploitation tool if on-confirmed flag is set
+							if *onConfirmed != "" && *onConfirmed != "none" {
+								if err := launchExploitation(modifiedURL, false, *onConfirmed); err != nil {
+									fmt.Printf(Yellow("Warning: Failed to launch exploitation: %v\n"), err)
 								}
+							}
+
+							sqlFoundCount++
+							if *stop > 0 && sqlFoundCount >= *stop {
+								fmt.Println(Cyan("Stopping further checks for this DOMAIN due to stop flag."))
+								cancel()
+								return
 							}
 						} else {
-							fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s]\n"), modifiedURL, statusCode, server, responseTime)
+							if *noColor {
+								fmt.Printf("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n", modifiedURL, statusCode, server, verifySummary)
+							} else {
+								fmt.Printf(Green("SQLI FP CONFIRMED: %s [%d] [%s] [%s]\n"), modifiedURL, statusCode, server, verifySummary)
+							}
 						}
-					}(payload)
+					}
+				} else {
+					fmt.Printf(Green("NOT FOUND: %s [%d] [%s] [%.2f s] [Payload: %s]\n"), modifiedURL, statusCode, server, responseTime, payloadDisplay)
 				}
 			}
-			payloadWg.Wait()
 		}
 	} else if *list != "" {
 		file, err := os.Open(*list)
@@ -1333,27 +1418,17 @@ func main() {
 		defer file.Close()
 
 		scanner := bufio.NewScanner(file)
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, *maxParallel)
 
 		for scanner.Scan() {
 			url := scanner.Text()
 			if strings.Contains(url, "*") {
-				sem <- struct{}{}
-				wg.Add(1)
-				go func(url string) {
-					defer func() { <-sem }()
-
-					// Create a new context and cancel function for each URL
-					ctx, cancel := context.WithCancel(context.Background())
-					stopOnce := &sync.Once{} // Reset stopOnce for each URL
-					processURL(ctx, cancel, url, payloads, *responseFlag, *verify, *verifyDelay, *retries, *noColor, *userAgent, *stop, &wg, &mu, stopOnce, *maxConcurrency, *requiredCount, *proxy, *output, *onConfirmed)
-				}(url)
+				// Create a new context and cancel function for each URL
+				urlCtx, urlCancel := context.WithCancel(context.Background())
+				processURL(urlCtx, urlCancel, url, payloads, *verify, *retries, *noColor, *userAgent, *stop, *proxy, *output, *onConfirmed)
 			} else {
 				fmt.Printf(Cyan("Skipping URL (Not * found): %s\n"), url)
 			}
 		}
-		wg.Wait()
 
 		if err := scanner.Err(); err != nil {
 			fmt.Println("Error reading the file:", err)
